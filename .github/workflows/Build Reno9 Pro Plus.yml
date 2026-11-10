@@ -1,15 +1,23 @@
 name: Build Reno9 Pro Plus
 
-# 重写版（2026-11-10）
-# 原版由 TNTyep520 于 2025-07-15 提交后再未跑通，存在以下硬伤：
-#   1. inputs 缩进错误（KSU_META 与 inputs 同级）→ 无法传参
-#   2. "Pull Kernel Open Source" 把源码 clone 到 kernel_workspace/common，
-#      但下一步写的是 `cd common` → 必然 No such file or directory
-#   3. 多出无配对的 fi、for 循环缺 do、cp 路径多退一级
-#   4. 从未下载 clang（引用 prebuilts-master 但没有任何步骤拉取）
-# 本版：全流程自洽（源码固定在 $GITHUB_WORKSPACE/common），clang 取自
-# LineageOS 的 r416183b 预编译（与 OPPO build.config.gki.aarch64 的 CLANG_VERSION 一致），
-# defconfig 后立即校验关键项是否生效，避免白等一小时。
+# 重写版（2026-11-10，第 2 版）
+#
+# 原版由 TNTyep520 于 2025-07-15 提交后再未跑通，硬伤：
+#   1. inputs 缩进错误（KSU_META 与 inputs 同级）→ 传参 422
+#   2. 源码 clone 到 kernel_workspace/common，下一步却 `cd common`
+#   3. 多出无配对 fi、for 循环缺 do、cp 路径多退一级
+#   4. 从未下载 clang（引用 prebuilts-master 但没任何步骤拉取）
+#
+# 第 2 版修正（run #5 暴露的真因）：
+#   `init/Kconfig:857: can't open file "kernel/oplus_cpu/sched/Kconfig"`
+#   该路径是符号链接，指向 ../../../vendor/oplus/kernel/cpu —— OPPO 把源码
+#   拆成两个仓库发布，common 树本身不完整。正确布局：
+#     <ws>/kernel_platform/common    ← android_kernel_common_oppo_sm8475
+#     <ws>/kernel_platform/{build,oplus,qcom}
+#     <ws>/vendor/...                ← android_kernel_modules_and_devicetree_oppo_sm8475
+#   三个外链：kernel/oplus_cpu → vendor/oplus/kernel/cpu
+#             drivers/soc/oplus/storage → vendor/oplus/kernel/storage
+#             android/abi_gki_aarch64_oplus_internal → kernel_platform/oplus/config/...
 
 on:
   workflow_dispatch:
@@ -29,6 +37,7 @@ jobs:
     timeout-minutes: 200
     env:
       KERNEL_REPO: 'https://github.com/oppo-source/android_kernel_common_oppo_sm8475'
+      MODULES_REPO: 'https://github.com/oppo-source/android_kernel_modules_and_devicetree_oppo_sm8475'
       KERNEL_BRANCH: 'oppo/sm8475_b_16.0_reno9_pro_plus'
       CLANG_REPO: 'https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b'
       CLANG_BRANCH: 'lineage-20.0'
@@ -76,20 +85,55 @@ jobs:
           test -x "$CLANG_DIR/bin/ld.lld"
           test -x "$CLANG_DIR/bin/llvm-ar"
 
-      - name: Fetch kernel source
+      - name: Fetch kernel source (common + modules)
         run: |
-          rm -rf common
-          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" common
-          echo "HEAD: $(git -C common rev-parse --short HEAD)"
-          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' common/Makefile
-          # 版本串不带 -dirty / 随机后缀：setlocalversion 输出置空，
-          # 由 CONFIG_LOCALVERSION 全权决定 kernel.release
-          printf '#!/bin/sh\nexit 0\n' > common/scripts/setlocalversion
-          chmod +x common/scripts/setlocalversion
-          sed -i 's/check_defconfig//' common/build.config.gki || true
+          set -e
+          rm -rf common kernel_platform vendor modsrc
+          mkdir -p kernel_platform
+
+          # ① GKI common 树
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel_platform/common
+          echo "common HEAD: $(git -C kernel_platform/common rev-parse --short HEAD)"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel_platform/common/Makefile
+
+          # ② OPPO 私有模块 + 设备树（提供 vendor/oplus 与 kernel_platform 的补充件）
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$MODULES_REPO" modsrc
+          echo "modules HEAD: $(git -C modsrc rev-parse --short HEAD)"
+
+          # ③ 拼成 OPPO 原始仓库布局
+          for d in build oplus qcom; do
+            if [ -d "modsrc/kernel_platform/$d" ]; then
+              rm -rf "kernel_platform/$d"
+              mv "modsrc/kernel_platform/$d" "kernel_platform/$d"
+            fi
+          done
+          mv modsrc/vendor ./vendor
+          rm -rf modsrc
+
+          # 版本串去掉 -dirty / 随机后缀，交给 CONFIG_LOCALVERSION
+          printf '#!/bin/sh\nexit 0\n' > kernel_platform/common/scripts/setlocalversion
+          chmod +x kernel_platform/common/scripts/setlocalversion
+          sed -i 's/check_defconfig//' kernel_platform/common/build.config.gki || true
+
+      - name: Verify tree layout (symlinks resolve)
+        run: |
+          set -e
+          K=kernel_platform/common
+          echo "=== 三个外链目标 ==="
+          for p in "$K/kernel/oplus_cpu/sched" "$K/drivers/soc/oplus/storage" \
+                   "kernel_platform/oplus/config"; do
+            if [ -e "$p" ]; then echo "  OK   $p"; else echo "  MISS $p"; exit 1; fi
+          done
+          echo "=== 关键 Kconfig 可读 ==="
+          test -r "$K/kernel/oplus_cpu/sched/Kconfig" && echo "  OK   oplus_cpu/sched/Kconfig"
+          echo "=== 断链检查（仅记录，不阻断）==="
+          broken=$(find "$K/kernel" "$K/drivers/soc" -xtype l 2>/dev/null || true)
+          if [ -n "$broken" ]; then echo "$broken" | head -20; else echo "  无断链"; fi
+          echo "=== vendor/oplus/kernel ==="
+          ls vendor/oplus/kernel | head -30
 
       - name: Apply hmbird patch (OGKI to GKI)
-        working-directory: ${{ github.workspace }}/common
+        working-directory: ${{ github.workspace }}/kernel_platform/common
         run: |
           sed -i '1i obj-y += hmbird_patch.o' drivers/Makefile
           patch -p1 -F 3 < "${GITHUB_WORKSPACE}/Patches/hmbird_patch.patch"
@@ -98,7 +142,7 @@ jobs:
 
       - name: Add KernelSU
         if: ${{ github.event.inputs.ENABLE_KSU == 'true' }}
-        working-directory: ${{ github.workspace }}/common
+        working-directory: ${{ github.workspace }}/kernel_platform/common
         run: |
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
           echo "--- 安装结果 ---"
@@ -108,7 +152,7 @@ jobs:
           grep -n "kernelsu" drivers/Kconfig
 
       - name: Patch defconfig
-        working-directory: ${{ github.workspace }}/common
+        working-directory: ${{ github.workspace }}/kernel_platform/common
         run: |
           CFG=arch/arm64/configs/gki_defconfig
           cat >> "$CFG" <<'EOF'
@@ -128,7 +172,6 @@ jobs:
             echo "CONFIG_KSU=y" >> "$CFG"
           fi
 
-          # 内核版本串：默认对齐 stock，保证 vendor 侧 .ko 的 vermagic 一致
           LV="${{ github.event.inputs.KERNEL_SUFFIX }}"
           if [ -z "$LV" ]; then
             LV="-android12-9-o-gdf413c13de93"
@@ -139,7 +182,7 @@ jobs:
           tail -15 "$CFG"
 
       - name: Configure (gki_defconfig) and verify
-        working-directory: ${{ github.workspace }}/common
+        working-directory: ${{ github.workspace }}/kernel_platform/common
         env:
           PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
@@ -170,7 +213,7 @@ jobs:
           ccache -z || true
 
       - name: Build kernel
-        working-directory: ${{ github.workspace }}/common
+        working-directory: ${{ github.workspace }}/kernel_platform/common
         env:
           PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
@@ -186,11 +229,11 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-          IMG=$(find common/out/arch/arm64/boot -maxdepth 1 -name 'Image' | head -1)
+          IMG=$(find kernel_platform/common/out/arch/arm64/boot -maxdepth 1 -name 'Image' | head -1)
           test -n "$IMG"
           cp "$IMG" dist/Image
-          cp common/out/.config dist/kernel.config
-          cat common/out/include/config/kernel.release > dist/KERNEL_RELEASE.txt
+          cp kernel_platform/common/out/.config dist/kernel.config
+          cat kernel_platform/common/out/include/config/kernel.release > dist/KERNEL_RELEASE.txt
           ls -la dist
           sha256sum dist/Image
 
