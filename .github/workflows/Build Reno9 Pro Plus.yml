@@ -174,6 +174,19 @@ jobs:
             "$S" --file out/.config --enable "$k"
           done
 
+          # stock 的 CONFIG_UNUSED_KSYMS_WHITELIST 指向 OPPO 编译机的绝对路径
+          # （/work/000f/workspace/.../abi_symbollist.raw），本机构建必然找不到。
+          # 关掉符号裁剪：保留全部 EXPORT_SYMBOL，是 stock 的超集，
+          # vendor_dlkm 里 377 个 .ko 需要的符号只会更多不会更少。
+          "$S" --file out/.config --disable TRIM_UNUSED_KSYMS
+          "$S" --file out/.config --set-str UNUSED_KSYMS_WHITELIST ""
+
+          # stock 是 CONFIG_LTO_CLANG_FULL=y（全量 LTO）。full LTO 在 4C/16G
+          # 的 runner 上极易 OOM 且慢一倍；LTO 模式不改变导出符号 CRC、
+          # 也不改变 vermagic 与 CFI 类型哈希，因此改用 THIN 换构建成功率。
+          "$S" --file out/.config --disable LTO_CLANG_FULL
+          "$S" --file out/.config --enable LTO_CLANG_THIN
+
           if [ "${{ github.event.inputs.ENABLE_KSU }}" = "true" ]; then
             "$S" --file out/.config --enable KSU
           fi
@@ -204,8 +217,8 @@ jobs:
             grep -qx "CONFIG_KSU=y" out/.config && echo "  OK   CONFIG_KSU" || { echo "  MISS CONFIG_KSU"; fail=1; }
           fi
 
-          echo "=== 版本串 ==="
-          grep -E '^CONFIG_LOCALVERSION=|^# CONFIG_LOCALVERSION_AUTO' out/.config
+          echo "=== 版本串 / LTO / 符号裁剪 ==="
+          grep -E '^CONFIG_LOCALVERSION=|^# CONFIG_LOCALVERSION_AUTO|^CONFIG_LTO_|^# CONFIG_LTO_|^CONFIG_TRIM_UNUSED_KSYMS|^# CONFIG_TRIM_UNUSED_KSYMS|^CONFIG_CFI_CLANG' out/.config
           echo "期望 kernel.release = 5.10.236$(grep '^CONFIG_LOCALVERSION=' out/.config | sed 's/^CONFIG_LOCALVERSION="\(.*\)"/\1/')"
 
           echo "=== 与 stock 的配置差异（模块兼容性关键指标）==="
