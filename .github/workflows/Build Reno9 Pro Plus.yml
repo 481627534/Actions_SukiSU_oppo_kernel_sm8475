@@ -253,6 +253,13 @@ jobs:
        # SukiSU Ultra 配置
        echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
 
+       # ===== PGW110 移植：补热点所需的 netfilter（对齐 Ace Pro 修复内核 G01aa75c）=====
+       # 本机 stock 内核这 4 项全是 not set，导致 tethering 的 iptables 规则失败
+       echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> "$CONFIG_FILE"
+       echo "CONFIG_NETFILTER_XT_TARGET_HL=y" >> "$CONFIG_FILE"
+       echo "CONFIG_NETFILTER_XT_SET=y" >> "$CONFIG_FILE"
+       echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> "$CONFIG_FILE"
+
        # KPM 配置
        if [ "${{ github.event.inputs.KPM }}" = "true" ]; then
         echo "CONFIG_KPM=y" >> "$CONFIG_FILE"
