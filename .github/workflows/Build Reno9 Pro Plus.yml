@@ -1,463 +1,224 @@
 name: Build Reno9 Pro Plus
+
+# 重写版（2026-11-10）
+# 原版由 TNTyep520 于 2025-07-15 提交后再未跑通，存在以下硬伤：
+#   1. inputs 缩进错误（KSU_META 与 inputs 同级）→ 无法传参
+#   2. "Pull Kernel Open Source" 把源码 clone 到 kernel_workspace/common，
+#      但下一步写的是 `cd common` → 必然 No such file or directory
+#   3. 多出无配对的 fi、for 循环缺 do、cp 路径多退一级
+#   4. 从未下载 clang（引用 prebuilts-master 但没有任何步骤拉取）
+# 本版：全流程自洽（源码固定在 $GITHUB_WORKSPACE/common），clang 取自
+# LineageOS 的 r416183b 预编译（与 OPPO build.config.gki.aarch64 的 CLANG_VERSION 一致），
+# defconfig 后立即校验关键项是否生效，避免白等一小时。
+
 on:
   workflow_dispatch:
     inputs:
-    KSU_META:
-      type: string
-      description: "分支/自定义版本标识"
-      required: false
-      default: "sufus-main/TNTyep520"
-    KERNEL_SUFFIX:
-      type: string
-      description: "自定义内核后缀（留空保持默认）"
-      required: false
-      default: ""
-    LZ4:
-      type: boolean
-      description: "是否启用 lz4 1.10.0 + zstd 1.5.7 补丁"
-      required: true
-      default: true
-    VFS:
-      type: boolean
-      description: "是否启用手动钩子（VFS）"
-      required: true
-      default: true
-    SSG:
-      type: boolean
-      description: "是否启用三星 SSG IO 调度器"
-      required: true
-      default: true
-    KPM:
-      type: boolean
-      description: "是否启用内核模块（KPM）"
-      required: true
-      default: true
-    ZRAM:
-      type: boolean
-      description: "是否启用 ZRAM 算法"
-      required: true
-      default: false
+      ENABLE_KSU:
+        description: '集成 KernelSU（官方 tiann）'
+        type: boolean
+        default: true
+      KERNEL_SUFFIX:
+        description: 'LOCALVERSION 后缀（留空 = 对齐 stock 的 -android12-9-o-gdf413c13de93）'
+        type: string
+        default: ''
 
 jobs:
- build:
-  runs-on: ubuntu-24.04
-  outputs:
-    ksuver: ${{ steps.ksu_version.outputs.ksuver }}
-  env:
-   CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-   CCACHE_NOHASHDIR: "true"
-   CCACHE_HARDLINK: "true"
-   CCACHE_MAXSIZE: 8G
-  steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 200
+    env:
+      KERNEL_REPO: 'https://github.com/oppo-source/android_kernel_common_oppo_sm8475'
+      KERNEL_BRANCH: 'oppo/sm8475_b_16.0_reno9_pro_plus'
+      CLANG_REPO: 'https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b'
+      CLANG_BRANCH: 'lineage-20.0'
+      CLANG_DIR: '/home/runner/clang-r416183b'
+      CCACHE_DIR: '/home/runner/.ccache_pgw110'
+      CCACHE_MAXSIZE: '6G'
+      CCACHE_COMPILERCHECK: 'content'
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_BASEDIR: '/home/runner/work'
 
-    - name: Check Disk Space
-      run: df -h
+    steps:
+      - name: Checkout (Patches/)
+        uses: actions/checkout@v4
 
-    - name: Maximize build space
-      uses: easimon/maximize-build-space@master
-      with:
-       root-reserve-mb: 8192
-       temp-reserve-mb: 2048
-       swap-size-mb: 8192
-       remove-dotnet: 'true'
-       remove-android: 'true'
-       remove-haskell: 'true'
-       remove-codeql: 'true'
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h
 
-    - name: Set Cache Environment
-      run: |
-       echo "CCACHE_DIR=$HOME/.ccache_reno9_pro_plus" >> $GITHUB_ENV
-       mkdir -p "$HOME/.ccache_reno9_pro_plus"
-       echo "set: $HOME/.ccache_reno9_pro_plus"
+      - name: Install dependencies
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev libncurses-dev \
+            python3 git curl wget ccache rsync unzip zip cpio kmod \
+            zlib1g-dev libxml2-utils dwarves lz4 device-tree-compiler
+          echo "--- 工具版本 ---"
+          gcc --version | head -1
+          python3 --version
+          (pahole --version || echo "pahole 缺失（BTF 可能失败）")
 
-    - name: Configure APTC
-      run: |
-       APT_CACHE_DIR="$HOME/apt-cache"
-       mkdir -p "$APT_CACHE_DIR"/{archives,lists/partial}
-       echo "Dir::Cache \"$APT_CACHE_DIR\";" | sudo tee /etc/apt/apt.conf.d/90user-cache
-       echo "Dir::Cache::archives \"$APT_CACHE_DIR/archives\";" | sudo tee -a /etc/apt/apt.conf.d/90user-cache
-       echo "Dir::State::lists \"$APT_CACHE_DIR/lists\";" | sudo tee -a /etc/apt/apt.conf.d/90user-cache
-       echo "Acquire::Check-Valid-Until \"false\";" | sudo tee -a /etc/apt/apt.conf.d/90user-cache
-       echo "Acquire::Languages \"none\";" | sudo tee -a /etc/apt/apt.conf.d/90user-cache
-       sudo chown -R $USER:$USER "$APT_CACHE_DIR"
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-pgw110-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-pgw110-
 
-    - name: Set APT Cache
-      uses: actions/cache@v3
-      with:
-        path: ${{ env.HOME }}/apt-cache
-        key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/Build Reno9 Pro Plus.yml') }}
-        restore-keys: |
-          ${{ runner.os }}-apt-
+      - name: Fetch clang r416183b
+        run: |
+          git clone --depth=1 -b "$CLANG_BRANCH" "$CLANG_REPO" "$CLANG_DIR"
+          "$CLANG_DIR/bin/clang" --version
+          test -x "$CLANG_DIR/bin/ld.lld"
+          test -x "$CLANG_DIR/bin/llvm-ar"
 
-    - name: Install and Config Dependencies
-      run: |
-       sudo rm -f /var/lib/apt/lists/lock /var/lib/dpkg/lock
-       APT_CACHE_DIR="$HOME/apt-cache"
-       mkdir -p "$APT_CACHE_DIR/lists/partial"
-       sudo apt -o Dir::Cache="$APT_CACHE_DIR" update -qq
-       sudo DEBIAN_FRONTEND=noninteractive apt -o Dir::Cache="$APT_CACHE_DIR" install -yq --no-install-recommends \
-       python3 git curl ccache libelf-dev \
-       build-essential flex bison libssl-dev \
-       libncurses-dev lz4 zlib1g-dev \
-       libxml2-utils rsync unzip
-       sudo apt update && sudo apt upgrade -y
-       sudo rm -rf ./llvm.sh
-       sudo wget https://apt.llvm.org/llvm.sh
-       sudo chmod +x llvm.sh
-       sudo sudo ./llvm.sh 20 all
+      - name: Fetch kernel source
+        run: |
+          rm -rf common
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" common
+          echo "HEAD: $(git -C common rev-parse --short HEAD)"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' common/Makefile
+          # 版本串不带 -dirty / 随机后缀：setlocalversion 输出置空，
+          # 由 CONFIG_LOCALVERSION 全权决定 kernel.release
+          printf '#!/bin/sh\nexit 0\n' > common/scripts/setlocalversion
+          chmod +x common/scripts/setlocalversion
+          sed -i 's/check_defconfig//' common/build.config.gki || true
 
-    - name: Restore Ccache
-      uses: actions/cache@v3
-      with:
-        path: ${{ env.CCACHE_DIR }}
-        key: ccache-${{ runner.os }}-${{ github.ref_name }}-reno9_pro_plus-${{ env.BUILD_METHOD }}
+      - name: Apply hmbird patch (OGKI to GKI)
+        working-directory: ${{ github.workspace }}/common
+        run: |
+          sed -i '1i obj-y += hmbird_patch.o' drivers/Makefile
+          patch -p1 -F 3 < "${GITHUB_WORKSPACE}/Patches/hmbird_patch.patch"
+          grep -n "hmbird_patch" drivers/Makefile
+          ls -la drivers/hmbird_patch.c
 
-    - name: Initialize Ccache
-      run: |
-       INIT_FLAG="${{ env.CCACHE_DIR }}/.ccache_initialized"
-       if command -v ccache >/dev/null 2>&1; then
-       if [ ! -f "$INIT_FLAG" ]; then
-        echo "初始化 Ccache (${{ env.CCACHE_DIR }})..."
-        mkdir -p "${{ env.CCACHE_DIR }}"
-        ccache -M ${{ env.CCACHE_MAXSIZE }}
-        touch "$INIT_FLAG"
-        echo "Ccache 初始化完成"
-       else
-        echo "Ccache 已初始化，跳过"
-        fi
-       else
-        echo "未安装 Ccache，跳过"
-        fi
-       ccache -s
+      - name: Add KernelSU
+        if: ${{ github.event.inputs.ENABLE_KSU == 'true' }}
+        working-directory: ${{ github.workspace }}/common
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+          echo "--- 安装结果 ---"
+          ls -la KernelSU | head -5
+          ls -la drivers/kernelsu
+          grep -n "KSU" drivers/Makefile
+          grep -n "kernelsu" drivers/Kconfig
 
-    # 拉取内核源码 && 去除 ABI 保护 && -dirty 后缀
-    - name: Pull Kernel Open Source
-      run: |
-       rm -rf kernel_workspace && mkdir kernel_workspace && cd kernel_workspace
-       git clone --depth=1 https://github.com/oppo-source/android_kernel_common_oppo_sm8475 -b oppo/sm8475_b_16.0_reno9_pro_plus common
-       sed -i 's/ -dirty//g' common/scripts/setlocalversion
-       sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion
-       
-    # 添加 SukiSU Ultra
-    - name: Add SukiSU Ultra
-      run: |
-       cd common
-       curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/refs/heads/main/kernel/setup.sh" | bash -s susfs-main
-       cd ./KernelSU
-       KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10606)
-       echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-       export KSU_VERSION=$KSU_VERSION
-       sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+      - name: Patch defconfig
+        working-directory: ${{ github.workspace }}/common
+        run: |
+          CFG=arch/arm64/configs/gki_defconfig
+          cat >> "$CFG" <<'EOF'
 
-    # 应用 SukiSU Ultra && Sufus,Lz4k 补丁
-    - name: Patch SukiSU Ultra && Sufus,Lz4k
-      run: |
-       cd kernel_workspace
-       git clone https://github.com/ShirkNeko/susfs4ksu.git -b gki-android12-5.10
-       git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git
-       cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./common/
-       cp ../susfs4ksu/kernel_patches/fs/* ./common/fs/
-       cp ../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
-       cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./common/include/linux
-       cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./common/lib
-       cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./common/crypto
-       cp -r ../SukiSU_patch/other/zram/lz4k_oplus ./common/lib
-       cd ./common
-       patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch || true
-       patch -p1 < syscall_hooks.patch || true
+          # ===== PGW110 移植：补齐热点（tethering）所需 netfilter =====
+          # 本机 stock 内核：ADDRTYPE / TARGET_HL / XT_SET / IP6_NF_NAT 均为 not set
+          # IP_SET 是 XT_SET 的 Kconfig 依赖，IP6_NF_NAT 是 IP6 MASQUERADE 的依赖
+          CONFIG_IP_SET=y
+          CONFIG_NETFILTER_XT_SET=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          CONFIG_NETFILTER_XT_TARGET_HL=y
+          CONFIG_IP6_NF_NAT=y
+          CONFIG_IP6_NF_TARGET_MASQUERADE=y
+          EOF
 
-    # 应用 Hide Stuff 补丁
-    - name: Apply Hide Stuff Patches
-      run: |
-       cd kernel_workspace/common
-       cp ../../SukiSU_patch/69_hide_stuff.patch ./
-       patch -p1 -F 3 < 69_hide_stuff.patch
-
-    # Convert OGKI to GKI,Fuck You dtbo
-    - name: Apply Convert OGKI to GKI
-      run: |
-       cd kernel_workspace/common
-       sed -i '1iobj-y += hmbird_patch.o' drivers/Makefile
-           wget https://raw.githubusercontent.com/TNTyep520/Actions_SukiSU_oppo_kernel_sm8475/SukiSU-Ultra/Patches/hmbird_patch.patch
-           patch -p1 -F 3 < hmbird_patch.patch
-        
-    - name: Apply VFS
-      if: ${{ github.event.inputs.VFS == 'true' }}
-      run: |
-       cd kernel_workspace/common
-       cp ../../SukiSU_patch/hooks/syscall_hooks.patch ./
-       patch -p1 -F 3 < syscall_hooks.patch
-        
-    - name: Apply ZRAM
-      if: ${{ github.event.inputs.ZRAM == 'true' }}
-      run: |
-       cd kernel_workspace/common
-       cp ../../SukiSU_patch/other/zram/zram_patch/5.10/lz4kd.patch
-       patch -p1 -F 3 < lz4kd.patch || true
-       cp ../../SukiSU_patch/other/zram/zram_patch/5.10/lz4k_oplus.patch
-       patch -p1 -F 3 < lz4k_oplus.patch || true
-
-    - name: Apply lz4 && zstd
-      if: ${{ github.event.inputs.LZ4 == 'true' }}
-      run: |
-       cd kernel_workspace
-       wget https://raw.githubusercontent.com/TNTyep520/Actions_SukiSU_oppo_kernel_sm8475/SukiSU-Ultra/Patches/zram_patch/lz4/001-lz4.patch
-       wget https://raw.githubusercontent.com/TNTyep520/Actions_SukiSU_oppo_kernel_sm8475/SukiSU-Ultra/Patches/zram_patch/lz4/lz4armv8.S
-       wget https://raw.githubusercontent.com/TNTyep520/Actions_SukiSU_oppo_kernel_sm8475/SukiSU-Ultra/Patches/zram_patch/zstd/002-zstd.patch
-       cp 001-lz4.patch ./common/
-       cp lz4armv8.S ./common/lib
-       cp 002-zstd.patch ./common/
-       cd ./common
-       git apply -p1 < 001-lz4.patch || true
-       patch -p1 < 002-zstd.patch || true
-
-    - name: Custom Kernel Suffix if set
-      run: |
-       if [ "${{ github.event.inputs.KERNEL_SUFFIX }}" = "true" ]; then
-       echo "当前内核版本后缀：${{ github.event.inputs.KERNEL_SUFFIX }}"
-        for f in ./common/scripts/setlocalversion; do
-       sed -i "\$s|echo \"\\\$res\"|echo \"-${{ github.event.inputs.KERNEL_SUFFIX }}\"|" "$f"
-        done
-       else
-       RANDOM_DIGIT=$(od -An -N1 -tu1 < /dev/urandom | tr -d '[:space:]' | awk '{print $1 % 11}')
-       RANDOM_HASH=$(od -An -N7 -tx1 /dev/urandom | tr -d ' \n')
-       RANDOM_SUFFIX="${RANDOM_DIGIT}-o-g${RANDOM_HASH}"
-
-       for path in \
-         ./common/scripts/setlocalversion \
-         ./msm-kernel/scripts/setlocalversion \
-
-         [ -f "$path" ] || continue
-
-           echo "Modifying: $path"
-
-        if grep -q 'KERNELVERSION.*scm_version' "$path"; then
-         echo "Detected NEW setlocalversion format"
-         sed -i "s|echo \"\${KERNELVERSION}.*scm_version}\"|echo \"\${KERNELVERSION}-android12-${RANDOM_SUFFIX}\"|" "$path"
-
-         elif grep -q 'echo "\$res"' "$path"; then
-         echo "Detected OLD setlocalversion format"
-         echo "FAST_BUILD enabled: using static res with random suffix"
-         sed -i "s/^res=.*/res=\"-android12-${RANDOM_SUFFIX}\"/" "$path"
-          fi
-        done
-
-    - name: Configuration Settings
-      run: |
-       cd kernel_workspace
-       CONFIG_FILE=./common/arch/arm64/configs/gki_defconfig
-       KERNEL_VERSION="5.10"
-
-       # SukiSU Ultra 配置
-       echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
-
-       # ===== PGW110 移植：补热点所需的 netfilter（对齐 Ace Pro 修复内核 G01aa75c）=====
-       # 本机 stock 内核这 4 项全是 not set，导致 tethering 的 iptables 规则失败
-       echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> "$CONFIG_FILE"
-       echo "CONFIG_NETFILTER_XT_TARGET_HL=y" >> "$CONFIG_FILE"
-       echo "CONFIG_NETFILTER_XT_SET=y" >> "$CONFIG_FILE"
-       echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> "$CONFIG_FILE"
-
-       # KPM 配置
-       if [ "${{ github.event.inputs.KPM }}" = "true" ]; then
-        echo "CONFIG_KPM=y" >> "$CONFIG_FILE"
-         fi
-
-       # VFS 配置
-       if [ "${{ github.event.inputs.VFS }}" = "true" ]; then
-        echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> "$CONFIG_FILE"
-        echo "CONFIG_KSU_MANUAL_HOOK=n" >> "$CONFIG_FILE"
-        echo "CONFIG_KSU_KPROBES_HOCK=y"
-         else
-        echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$CONFIG_FILE"
-        echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CONFIG_FILE"
-         fi
-
-       # SUSFS 配置
-       echo "CONFIG_KSU_SUSFS=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$CONFIG_FILE"
-       echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$CONFIG_FILE"
-
-       # lz4 && zstd 配置
-       if [ "${{ github.event.inputs.LZ4 }}" = "true" ]; then
-        echo "CONFIG_ZSMALLOC=y" >> "$CONFIG_FILE"
-        echo "CONFIG_CRYPTO_LZ4HC=y" >> "$CONFIG_FILE"
-        echo "CONFIG_CRYPTO_LZ4K=y" >> "$CONFIG_FILE"
-        echo "CONFIG_CRYPTO_LZ4KD=y" >> "$CONFIG_FILE"
-        echo "CONFIG_CRYPTO_842=y" >> "$CONFIG_FILE"
-
-        # TMPFS 配置
-        echo "CONFIG_TMPFS_XATTR=y" >> "$CONFIG_FILE"
-        echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$CONFIG_FILE"
-
-        # BBR 配置
-        echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$CONFIG_FILE"
-        echo "CONFIG_TCP_CONG_BBR=y" >> "$CONFIG_FILE"
-        echo "CONFIG_NET_SCH_FQ=y" >> "$CONFIG_FILE"
-        echo "CONFIG_TCP_CONG_BIC=n" >> "$CONFIG_FILE"
-        echo "CONFIG_TCP_CONG_WESTWOOD=n" >> "$CONFIG_FILE"
-        echo "CONFIG_TCP_CONG_HTCP=n" >> "$CONFIG_FILE"
-
-        # ECN 配置
-        echo "CONFIG_IP_ECN=y" >> "$CONFIG_FILE"
-        echo "CONFIG_TCP_ECN=y" >> "$CONFIG_FILE"
-        echo "CONFIG_IPV6_ECN=y" >> "$CONFIG_FILE"
-        echo "CONFIG_IP_NF_TARGET_ECN=y" >> "$CONFIG_FILE"
-
-        # SSG IO 配置
-        if [ "${{ github.event.inputs.LZ4 }}" = "true" ]; then
-         echo "CONFIG_MQ_IOSCHED_SSG=y" >> $CONFIG_FILE
-         echo "CONFIG_MQ_IOSCHED_SSG_CGROUP=y" >> $CONFIG_FILE
-
-         # ZRAM 配置
-         if [ "${{ github.event.inputs.ZRAM }}" = "true" ]; then
-          echo "CONFIG_CRYPTO_LZ4HC=y" >> "$CONFIG_FILE"
-          echo "CONFIG_CRYPTO_LZ4K=y" >> "$CONFIG_FILE"
-          echo "CONFIG_CRYPTO_LZ4KD=y" >> "$CONFIG_FILE"
-          echo "CONFIG_CRYPTO_842=y" >> "$CONFIG_FILE"
-          echo "CONFIG_CRYPTO_LZ4K_OPLUS=y" >> "$CONFIG_FILE"
-          echo "CONFIG_ZRAM_WRITEBACK=y" >> "$CONFIG_FILE"
-           fi
-
-         # 禁用 defconfig 审查
-         sed -i 's/check_defconfig//' ./common/build.config.gki
-
-    - name: Build Kernel
-      run: |
-       CLANG_PATH="clang-r416183b"
-       CLANG_DIR="prebuilts-master"
-       USE_LLVM_IAS=true
-       export PATH="$GITHUB_WORKSPACE/kernel_workspace/$CLANG_DIR/clang/host/linux-x86/$CLANG_PATH/bin:$PATH"
-       export PATH="/usr/lib/ccache:$PATH"
-       export CC="ccache clang"
-       sudo apt install -y libelf-dev ccache
-       cd kernel_workspace/common
-       MAKE_ARGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-       RUSTC=../../prebuilts/rust/linux-x86/1.73.0b/bin/rustc \
-       PAHOLE=../../prebuilts/kernel-build-tools/linux-x86/bin/pahole \
-       LD=ld.lld HOSTLD=ld.lld KCFLAGS+=-Wno-error"
-       if [[ "$USE_LLVM_IAS" == "true" ]]; then
-        MAKE_ARGS="LLVM_IAS=1 $MAKE_ARGS"
-       fi
-       make -j$(nproc --all) O=out $MAKE_ARGS gki_defconfig
-       make -j$(nproc --all) O=out $MAKE_ARGS
-       ccache -s
-        
-    - name: Make AnyKernel3
-      run: |
-       git clone https://github.com/Numbersf/AnyKernel3 --depth=1
-       rm -rf ./AnyKernel3/.git
-       mkdir -p kernel_workspace/out/Final-Image-Find/
-       dir1=""
-       dir2=""
-       image_path=$(find "./kernel_workspace/common/out/" -name "Image" | head -n 1)
-       if [ -n "$image_path" ]; then
-       dir1=$(dirname "$image_path")/
-       echo "使用 make 编译的统一路径，成功找到 Image 文件"
-       else
-       echo "未找到 Image 文件，构建失败" >&2
-       exit 1
-       fi
-       if [ -n "$image_path" ] && [ -f "$image_path" ]; then
-        echo "Image file finally located at: $image_path"
-        cp "$image_path" ./AnyKernel3/Image
-        cp "$image_path" kernel_workspace/out/Final-Image-Find/Image
-         fi
-        fi
-    - name: Apply patch_linux and replace Image
-      if: ${{ github.event.inputs.KPM == 'true' }}
-      run: |
-       cd kernel_workspace/out/Final-Image-Find
-       curl -LO --retry 5 --retry-delay 2 --retry-connrefused https://raw.githubusercontent.com/Numbersf/Action-Build/SukiSU-Ultra/patches/patch_linux
-       chmod +x patch_linux
-       ./patch_linux
-       rm -f Image
-       mv oImage Image
-       cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
-
-    - name: Download Latest SUSFS Module from CI
-      if: ${{ github.event.inputs.SUSFS_CI == 'CI' }}
-      continue-on-error: true
-      run: |
-       LATEST_RUN_ID=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-       "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs?status=success" | \
-        jq -r '.workflow_runs[] | select(.head_branch == "v1.5.2+") | .id' | head -n 1)
-        if [ -z "$LATEST_RUN_ID" ]; then
-         echo "No successful run found for branch v1.5.2+"
-        else
-        ARTIFACT_URL=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-        "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs/$LATEST_RUN_ID/artifacts" | jq -r '.artifacts[0].archive_download_url')
-         if [ -n "$ARTIFACT_URL" ]; then
-          curl -L -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -o ksu_module_susfs_1.5.2+_CI.zip "$ARTIFACT_URL"
-           cp ksu_module_susfs_1.5.2+_CI.zip ./AnyKernel3/
-         else
-          echo "Failed to fetch artifact URL"
-           fi
+          if [ "${{ github.event.inputs.ENABLE_KSU }}" = "true" ]; then
+            echo "CONFIG_KSU=y" >> "$CFG"
           fi
 
-    - name: Upload AnyKernel3
-      uses: actions/upload-artifact@v4
-      with:
-        name: AnyKernel3_SukiSUUltra_${{ env.KSUVER }}_${{ steps.file_clean.outputs.value }}${{ steps.suffix.outputs.value }}
-        path: ./AnyKernel3/*
-
-    - name: Download and Unzip ZRAM
-      if: ${{ github.event.inputs.ZRAM == 'true' }}
-      id: zram_find
-      run: |
-       set -e
-       sudo apt install -y unzip
-       curl -s https://api.github.com/repos/FurLC/ZRAM-Module/releases/latest | \
-       grep "browser_download_url" | grep "ZRAM-Module-.*\.zip" | cut -d '"' -f 4 | xargs wget -N
-       unzip "$(ls -t ZRAM-Module-*.zip | head -1)" -d ZRAM-Module
-       target="./ZRAM-Module/zram/zram.ko"
-       echo "查找 zram.ko 模块文件..."
-       search_paths=(
-          "./kernel_workspace/out"
-          "./kernel_workspace/device/qcom"
-          )
-       zram_path=""
-       for path in "${search_paths[@]}"; do
-        zram_path=$(find "$path" -type f -name "zram.ko" | head -n 1)
-        [ -n "$zram_path" ] && break
-        done
-       if [ -z "$zram_path" ]; then
-        zram_path=$(find "./kernel_workspace" -type f -name "zram.ko" | head -n 1)
-         fi
-       if [ -n "$zram_path" ] && [ -f "$zram_path" ]; then
-        echo " ZRAM module file finally located at: $zram_path "
-        mkdir -p "$(dirname "$target")"
-       if [ "$(realpath "$zram_path")" != "$(realpath "$target")" ]; then
-        cp "$zram_path" "$target"
-       else
-        echo "源文件与目标路径相同，跳过复制"
+          # 内核版本串：默认对齐 stock，保证 vendor 侧 .ko 的 vermagic 一致
+          LV="${{ github.event.inputs.KERNEL_SUFFIX }}"
+          if [ -z "$LV" ]; then
+            LV="-android12-9-o-gdf413c13de93"
           fi
-       else
-        echo "未找到 zram.ko 文件，可能是未支持的内核版本或者未成功构建"
-        echo "upload=false" >> "$GITHUB_OUTPUT"
-        exit 0
+          echo "CONFIG_LOCALVERSION=\"$LV\"" >> "$CFG"
+          echo "LOCALVERSION 将设为: $LV"
+          echo "--- 追加的配置 ---"
+          tail -15 "$CFG"
+
+      - name: Configure (gki_defconfig) and verify
+        working-directory: ${{ github.workspace }}/common
+        env:
+          PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+
+          echo "=== 关键配置校验 ==="
+          fail=0
+          for k in CONFIG_IP_SET CONFIG_NETFILTER_XT_SET \
+                   CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_NETFILTER_XT_TARGET_HL \
+                   CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE; do
+            if grep -qx "${k}=y" out/.config; then
+              echo "  OK   $k"
+            else
+              echo "  MISS $k"
+              grep -E "^# ${k} is not set|^${k}=" out/.config || echo "        (.config 里完全没有这一项)"
+              fail=1
+            fi
+          done
+          if [ "${{ github.event.inputs.ENABLE_KSU }}" = "true" ]; then
+            grep -qx "CONFIG_KSU=y" out/.config && echo "  OK   CONFIG_KSU" || { echo "  MISS CONFIG_KSU"; fail=1; }
           fi
+          echo "=== 版本串 ==="
+          grep -E '^CONFIG_LOCALVERSION=' out/.config
+          if [ "$fail" != "0" ]; then
+            echo "::error::关键配置有缺失，终止构建（省一小时）"
+            exit 1
+          fi
+          ccache -z || true
 
-    - name: Upload ZRAM Module
-      if: ${{ github.event.inputs.ZRAM == 'true' && steps.zram_find.outputs.upload != 'false' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: ZRAM-Module_android12_${{ steps.file_clean.outputs.value }}
-        path: ZRAM-Module/*
+      - name: Build kernel
+        working-directory: ${{ github.workspace }}/common
+        env:
+          PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1
+          echo "=== 产物 ==="
+          ls -la out/arch/arm64/boot/
+          echo "=== kernel.release ==="
+          cat out/include/config/kernel.release
+          echo
+          ccache -s || true
 
-    - name: Post-build Disk Check
-      run: df -h
+      - name: Package (Image + AnyKernel3)
+        run: |
+          set -e
+          mkdir -p dist
+          IMG=$(find common/out/arch/arm64/boot -maxdepth 1 -name 'Image' | head -1)
+          test -n "$IMG"
+          cp "$IMG" dist/Image
+          cp common/out/.config dist/kernel.config
+          cat common/out/include/config/kernel.release > dist/KERNEL_RELEASE.txt
+          ls -la dist
+          sha256sum dist/Image
+
+          git clone --depth=1 https://github.com/Numbersf/AnyKernel3 anykernel
+          rm -rf anykernel/.git
+          cp dist/Image anykernel/Image
+          cd anykernel
+          zip -r9 ../dist/AnyKernel3.zip . -x '*.git*' > /dev/null
+          cd ..
+          ls -la dist
+          sha256sum dist/AnyKernel3.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PGW110-kernel-5.10.236-${{ github.run_number }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "### PGW110 内核构建结果"
+            echo ""
+            echo "- 源码分支：\`$KERNEL_BRANCH\`"
+            echo "- 内核版本：\`$(cat dist/KERNEL_RELEASE.txt)\`"
+            echo "- Image 大小：$(stat -c%s dist/Image) B"
+            echo "- KernelSU：${{ github.event.inputs.ENABLE_KSU }}"
+            echo ""
+            echo "产物：\`Image\`、\`AnyKernel3.zip\`、\`kernel.config\`"
+          } >> $GITHUB_STEP_SUMMARY
