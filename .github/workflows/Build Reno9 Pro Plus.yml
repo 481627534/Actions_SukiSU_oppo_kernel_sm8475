@@ -136,7 +136,7 @@ jobs:
     - name: Pull Kernel Open Source
       run: |
        rm -rf kernel_workspace && mkdir kernel_workspace && cd kernel_workspace
-       git clone --depth=1 https://github.com/oppo-source/android_kernel_common_oppo_sm8475 -b oppo/sm8475_v_15.0.0_reno9_pro_plus common
+       git clone --depth=1 https://github.com/oppo-source/android_kernel_common_oppo_sm8475 -b oppo/sm8475_b_16.0_reno9_pro_plus common
        sed -i 's/ -dirty//g' common/scripts/setlocalversion
        sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion
        
