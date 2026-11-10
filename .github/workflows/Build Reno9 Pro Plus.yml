@@ -42,6 +42,7 @@ jobs:
       CLANG_REPO: 'https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b'
       CLANG_BRANCH: 'lineage-20.0'
       CLANG_DIR: '/home/runner/clang-r416183b'
+      LV: ${{ github.event.inputs.KERNEL_SUFFIX || '-android12-9-o-gdf413c13de93' }}
       CCACHE_DIR: '/home/runner/.ccache_pgw110'
       CCACHE_MAXSIZE: '6G'
       CCACHE_COMPILERCHECK: 'content'
@@ -111,8 +112,7 @@ jobs:
           rm -rf modsrc
 
           # 版本串去掉 -dirty / 随机后缀，交给 CONFIG_LOCALVERSION
-          printf '#!/bin/sh\nexit 0\n' > kernel_platform/common/scripts/setlocalversion
-          chmod +x kernel_platform/common/scripts/setlocalversion
+          # 注意：不能清空 scripts/setlocalversion —— CONFIG_LOCALVERSION 正是它拼上去的
           sed -i 's/check_defconfig//' kernel_platform/common/build.config.gki || true
 
       - name: Verify tree layout (symlinks resolve)
@@ -159,14 +159,12 @@ jobs:
           S="scripts/config"
           chmod +x "$S"
 
-          # 版本串对齐 stock。stock 是 LOCALVERSION_AUTO=y + git describe 得到
-          # 5.10.236-android12-9-o-gdf413c13de93；这里改成固定串并关掉 AUTO，
-          # 保证 vermagic 与 vendor_dlkm 里 377 个预编译 .ko 完全一致。
-          LV="${{ github.event.inputs.KERNEL_SUFFIX }}"
-          if [ -z "$LV" ]; then LV="-android12-9-o-gdf413c13de93"; fi
-          "$S" --file out/.config --set-str LOCALVERSION "$LV"
+          # 版本串对齐 stock。scripts/setlocalversion 第 205 行会把
+          # ${CONFIG_LOCALVERSION}${LOCALVERSION} 拼到 5.10.236 后面，
+          # 所以后缀通过 make LOCALVERSION=... 传入；关掉 AUTO 防止再叠 git describe。
+          # 目标：5.10.236-android12-9-o-gdf413c13de93，与 vendor_dlkm 里 377 个 .ko 一致。
           "$S" --file out/.config --disable LOCALVERSION_AUTO
-          echo "LOCALVERSION = $LV ；LOCALVERSION_AUTO 已关闭"
+          echo "LOCALVERSION 将由 make 传入：$LV"
 
           # 6 项 netfilter：IP_SET 是 XT_SET 的依赖，IP6_NF_NAT 是 IP6 MASQUERADE 的依赖
           for k in IP_SET NETFILTER_XT_SET NETFILTER_XT_MATCH_ADDRTYPE \
@@ -217,9 +215,17 @@ jobs:
             grep -qx "CONFIG_KSU=y" out/.config && echo "  OK   CONFIG_KSU" || { echo "  MISS CONFIG_KSU"; fail=1; }
           fi
 
-          echo "=== 版本串 / LTO / 符号裁剪 ==="
-          grep -E '^CONFIG_LOCALVERSION=|^# CONFIG_LOCALVERSION_AUTO|^CONFIG_LTO_|^# CONFIG_LTO_|^CONFIG_TRIM_UNUSED_KSYMS|^# CONFIG_TRIM_UNUSED_KSYMS|^CONFIG_CFI_CLANG' out/.config
-          echo "期望 kernel.release = 5.10.236$(grep '^CONFIG_LOCALVERSION=' out/.config | sed 's/^CONFIG_LOCALVERSION="\(.*\)"/\1/')"
+          echo "=== LTO / 符号裁剪 / AUTO ==="
+          grep -E '^CONFIG_LTO_|^# CONFIG_LTO_|CONFIG_TRIM_UNUSED_KSYMS|^# CONFIG_LOCALVERSION_AUTO' out/.config
+          GOT=$(make -s O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+                CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION="$LV" kernelrelease)
+          echo "kernelrelease = $GOT  （期望 5.10.236$LV）"
+          if [ "$GOT" != "5.10.236$LV" ]; then
+            echo "::error::kernelrelease 与 stock vermagic 不符，模块会加载失败"
+            fail=1
+          else
+            echo "  OK   kernelrelease 与 stock 一致"
+          fi
 
           echo "=== 与 stock 的配置差异（模块兼容性关键指标）==="
           python3 - "${GITHUB_WORKSPACE}/Patches/pgw110_stock.config" <<'PYEOF'
@@ -258,7 +264,7 @@ jobs:
           PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
+               CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error LOCALVERSION="$LV"
           echo "=== 产物 ==="
           ls -la out/arch/arm64/boot/
           echo "=== kernel.release ==="

@@ -33,6 +33,7 @@ jobs:
       CLANG_REPO: 'https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b'
       CLANG_BRANCH: 'lineage-20.0'
       CLANG_DIR: '/home/runner/clang-r416183b'
+      LV: ${{ github.event.inputs.KERNEL_SUFFIX || '-android12-9-o-g-pgw110-270' }}
       CCACHE_DIR: '/home/runner/.ccache_pgw110_270'
       CCACHE_MAXSIZE: '6G'
       CCACHE_COMPILERCHECK: 'content'
@@ -89,8 +90,7 @@ jobs:
           mv src/kernel_vendor/vendor ./vendor
           rm -rf src
 
-          printf '#!/bin/sh\nexit 0\n' > kernel_platform/common/scripts/setlocalversion
-          chmod +x kernel_platform/common/scripts/setlocalversion
+          # 注意：不能清空 scripts/setlocalversion —— CONFIG_LOCALVERSION 正是它拼上去的
           sed -i 's/check_defconfig//' kernel_platform/common/build.config.gki || true
           echo "--- 布局 ---"
           ls kernel_platform
@@ -118,10 +118,9 @@ jobs:
           CONFIG_NETFILTER_XT_TARGET_HL=y
           CONFIG_IP6_NF_NAT=y
           CONFIG_IP6_NF_TARGET_MASQUERADE=y
-          CONFIG_LOCALVERSION="$LV"
           EOF
-          echo "LOCALVERSION = $LV"
-          tail -12 "$CFG"
+          echo "LOCALVERSION 将由 make 传入：$LV"
+          tail -11 "$CFG"
 
       - name: Configure and verify
         working-directory: ${{ github.workspace }}/kernel_platform/common
@@ -148,7 +147,8 @@ jobs:
             if grep -qx "${k}=y" out/.config; then echo "  OK   $k"; else echo "  MISS $k"; fail=1; fi
           done
           echo "=== 版本/LTO/裁剪 ==="
-          grep -E '^CONFIG_LOCALVERSION=|^CONFIG_LTO_|^# CONFIG_LTO_|CONFIG_TRIM_UNUSED_KSYMS' out/.config
+          grep -E '^CONFIG_LTO_|^# CONFIG_LTO_|CONFIG_TRIM_UNUSED_KSYMS' out/.config
+          make -s O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION="$LV" kernelrelease
           if [ "$fail" != "0" ]; then echo "::error::关键配置缺失"; exit 1; fi
           ccache -z || true
 
@@ -158,7 +158,7 @@ jobs:
           PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
+               CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error LOCALVERSION="$LV"
           ls -la out/arch/arm64/boot/
           echo "=== kernel.release ==="
           cat out/include/config/kernel.release
