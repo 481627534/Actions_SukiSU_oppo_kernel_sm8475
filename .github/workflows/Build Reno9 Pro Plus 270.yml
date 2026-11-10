@@ -1,0 +1,185 @@
+name: Build Reno9 Pro Plus 270
+
+# 目标：用 TNTyep520/kernel_reno9_sm8475_bundle (main, 5.10.270) 编一份 Image。
+#
+# ⚠️ 重要前提（写在这里，避免以后误用）：
+#   1. 本机 stock 是 5.10.236，/vendor_dlkm 里 377 个预编译 .ko 全是 236 的，
+#      且 CONFIG_MODVERSIONS=y。270 的内核 vermagic 与这些模块不符，
+#      模块会全部拒绝加载（面板/触控/IPA/DWC3 等都是模块）⇒ 只换 Image 开不了机。
+#   2. 该 bundle 的 kernel_common 是「纯净 ACK 树」（全树 0 处 oplus 引用），
+#      OPPO 代码都在 kernel_vendor/vendor/oplus/kernel/*；而
+#      kernel_vendor/kernel_platform/build/build.config 指向不存在的 ../build.config，
+#      官方 build.sh 入口是断的 ⇒ 顺带编 vendor 模块这条路走不通。
+#
+# 因此本工作流的产出仅用于：
+#   · 确认 5.10.270 这棵树能否在本环境编过
+#   · 拿到 Image 做对比分析（不是可刷机件）
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_SUFFIX:
+        description: 'LOCALVERSION 后缀'
+        type: string
+        default: '-android12-9-o-g-pgw110-270'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 200
+    env:
+      BUNDLE_REPO: 'https://github.com/TNTyep520/kernel_reno9_sm8475_bundle'
+      BUNDLE_BRANCH: 'main'
+      CLANG_REPO: 'https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b'
+      CLANG_BRANCH: 'lineage-20.0'
+      CLANG_DIR: '/home/runner/clang-r416183b'
+      CCACHE_DIR: '/home/runner/.ccache_pgw110_270'
+      CCACHE_MAXSIZE: '6G'
+      CCACHE_COMPILERCHECK: 'content'
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_BASEDIR: '/home/runner/work'
+
+    steps:
+      - name: Checkout (Patches/)
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev libncurses-dev \
+            python3 git curl wget ccache rsync unzip zip cpio kmod \
+            zlib1g-dev libxml2-utils dwarves lz4 device-tree-compiler
+          gcc --version | head -1
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-pgw110-270-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-pgw110-270-
+
+      - name: Fetch clang r416183b
+        run: |
+          git clone --depth=1 -b "$CLANG_BRANCH" "$CLANG_REPO" "$CLANG_DIR"
+          "$CLANG_DIR/bin/clang" --version
+
+      - name: Fetch bundle (5.10.270)
+        run: |
+          set -e
+          rm -rf src kernel_platform vendor
+          git clone --depth=1 -b "$BUNDLE_BRANCH" "$BUNDLE_REPO" src
+          echo "HEAD: $(git -C src rev-parse --short HEAD)"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' src/kernel_common/Makefile
+
+          mkdir -p kernel_platform
+          mv src/kernel_common kernel_platform/common
+          for d in build oplus qcom; do
+            if [ -d "src/kernel_vendor/kernel_platform/$d" ]; then
+              mv "src/kernel_vendor/kernel_platform/$d" "kernel_platform/$d"
+            fi
+          done
+          mv src/kernel_vendor/vendor ./vendor
+          rm -rf src
+
+          printf '#!/bin/sh\nexit 0\n' > kernel_platform/common/scripts/setlocalversion
+          chmod +x kernel_platform/common/scripts/setlocalversion
+          sed -i 's/check_defconfig//' kernel_platform/common/build.config.gki || true
+          echo "--- 布局 ---"
+          ls kernel_platform
+          ls vendor
+
+      - name: Apply hmbird patch (OGKI to GKI)
+        working-directory: ${{ github.workspace }}/kernel_platform/common
+        run: |
+          sed -i '1i obj-y += hmbird_patch.o' drivers/Makefile
+          patch -p1 -F 3 < "${GITHUB_WORKSPACE}/Patches/hmbird_patch.patch"
+          ls -la drivers/hmbird_patch.c
+
+      - name: Patch defconfig
+        working-directory: ${{ github.workspace }}/kernel_platform/common
+        run: |
+          CFG=arch/arm64/configs/gki_defconfig
+          LV="${{ github.event.inputs.KERNEL_SUFFIX }}"
+          if [ -z "$LV" ]; then LV="-android12-9-o-g-pgw110-270"; fi
+          cat >> "$CFG" <<EOF
+
+          # ===== PGW110 移植：热点所需 netfilter =====
+          CONFIG_IP_SET=y
+          CONFIG_NETFILTER_XT_SET=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          CONFIG_NETFILTER_XT_TARGET_HL=y
+          CONFIG_IP6_NF_NAT=y
+          CONFIG_IP6_NF_TARGET_MASQUERADE=y
+          CONFIG_LOCALVERSION="$LV"
+          EOF
+          echo "LOCALVERSION = $LV"
+          tail -12 "$CFG"
+
+      - name: Configure and verify
+        working-directory: ${{ github.workspace }}/kernel_platform/common
+        env:
+          PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+               CROSS_COMPILE=aarch64-linux-gnu- gki_defconfig
+
+          S=scripts/config
+          chmod +x "$S"
+          "$S" --file out/.config --disable TRIM_UNUSED_KSYMS
+          "$S" --file out/.config --set-str UNUSED_KSYMS_WHITELIST ""
+          "$S" --file out/.config --disable LTO_CLANG_FULL
+          "$S" --file out/.config --enable LTO_CLANG_THIN
+          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+               CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+          echo "=== 关键配置校验 ==="
+          fail=0
+          for k in CONFIG_IP_SET CONFIG_NETFILTER_XT_SET \
+                   CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_NETFILTER_XT_TARGET_HL \
+                   CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE; do
+            if grep -qx "${k}=y" out/.config; then echo "  OK   $k"; else echo "  MISS $k"; fail=1; fi
+          done
+          echo "=== 版本/LTO/裁剪 ==="
+          grep -E '^CONFIG_LOCALVERSION=|^CONFIG_LTO_|^# CONFIG_LTO_|CONFIG_TRIM_UNUSED_KSYMS' out/.config
+          if [ "$fail" != "0" ]; then echo "::error::关键配置缺失"; exit 1; fi
+          ccache -z || true
+
+      - name: Build kernel
+        working-directory: ${{ github.workspace }}/kernel_platform/common
+        env:
+          PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+               CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
+          ls -la out/arch/arm64/boot/
+          echo "=== kernel.release ==="
+          cat out/include/config/kernel.release
+          echo
+          ccache -s || true
+
+      - name: Package
+        run: |
+          set -e
+          mkdir -p dist
+          IMG=$(find kernel_platform/common/out/arch/arm64/boot -maxdepth 1 -name 'Image' | head -1)
+          test -n "$IMG"
+          cp "$IMG" dist/Image
+          cp kernel_platform/common/out/.config dist/kernel.config
+          cat kernel_platform/common/out/include/config/kernel.release > dist/KERNEL_RELEASE.txt
+          ls -la dist
+          sha256sum dist/Image
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PGW110-kernel-5.10.270-${{ github.run_number }}
+          path: dist/*
+          if-no-files-found: error
