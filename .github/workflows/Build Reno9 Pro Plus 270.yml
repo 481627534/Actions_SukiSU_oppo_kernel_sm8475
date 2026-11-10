@@ -1,19 +1,38 @@
 name: Build Reno9 Pro Plus 270
 
-# 目标：用 TNTyep520/kernel_reno9_sm8475_bundle (main, 5.10.270) 编一份 Image。
+# 目标：用 TNTyep520/kernel_reno9_sm8475_bundle (main, 5.10.270) 编出 Image，
+#       并对「能否连带编出 OPPO 模块」做一次真实可行性探测。
 #
-# ⚠️ 重要前提（写在这里，避免以后误用）：
-#   1. 本机 stock 是 5.10.236，/vendor_dlkm 里 377 个预编译 .ko 全是 236 的，
-#      且 CONFIG_MODVERSIONS=y。270 的内核 vermagic 与这些模块不符，
-#      模块会全部拒绝加载（面板/触控/IPA/DWC3 等都是模块）⇒ 只换 Image 开不了机。
-#   2. 该 bundle 的 kernel_common 是「纯净 ACK 树」（全树 0 处 oplus 引用），
-#      OPPO 代码都在 kernel_vendor/vendor/oplus/kernel/*；而
-#      kernel_vendor/kernel_platform/build/build.config 指向不存在的 ../build.config，
-#      官方 build.sh 入口是断的 ⇒ 顺带编 vendor 模块这条路走不通。
+# ===== 历史（按 run 累积，别删）=====
+# run #1  42757943489 failure: scripts/*.sh 丢 exec 位
+#           → ../scripts/as-version.sh: Permission denied
+#           → Kconfig.include:47 Sorry, this assembler is not supported
+#           → gki_defconfig Error 2
+#           已修：Fetch 阶段 find + chmod +x
+# run #2  42765510103 failure: Build kernel 编译全平台 DTB
+#           → arch/arm64/boot/dts/allwinner/sun50i-a64.dtsi:6:10
+#             fatal error: 'dt-bindings/clock/sun50i-a64-ccu.h' file not found
+#           → Makefile:1498: dtbs Error 2
+#           原因：arm64 的 all: 目标含 dtbs，make 不带目标会把所有厂商板卡 DTB 都编一遍。
+#                 GKI 只要 Image，不需要 DTB。已修：显式指定 Image 目标。
 #
-# 因此本工作流的产出仅用于：
-#   · 确认 5.10.270 这棵树能否在本环境编过
-#   · 拿到 Image 做对比分析（不是可刷机件）
+# ===== 已知结构性问题（2026-11-10 查明，务必先读）=====
+#   该 bundle 是 zip 上传的仓库，除了 exec 位，**符号链接也被压成了普通文本文件**：
+#     官方 oppo-source 仓库： kernel_platform/build/build.config = symlink → ../build.config
+#     本 bundle：            kernel_platform/build/build.config = 15 字节普通文件，内容字面 "../build.config"
+#   而 OPPO 整套构建链依赖符号链接（kernel/oplus_cpu → vendor/oplus/kernel/cpu 等）。
+#   ⇒ 本工作流新增「还原符号链接」步骤（只在目标真实存在时才转，宁可不改也不误改）。
+#
+#   更根本：bundle 的 kernel_common 是【纯净 ACK 270 树】（全树 0 处 oplus 引用），
+#   而 OPPO 模块源码长在【带 OPPO hook 的 236 common 树】上。OPPO 从未给 sm8475 出过
+#   270 common 树 ⇒ 想让 236 模块源码在 270 上全量编过，缺的是内核侧的 hook 移植，
+#   不是 CI 配置。故本工作流只做「探测」，不承诺模块能编成。
+#
+# ===== 产物定位（别误用）=====
+#   Image 即使编过，也【不能】配设备上 377 个 5.10.236 预编译 .ko：
+#   kernel/module.c 的 same_magic() 在 MODVERSIONS=y 且模块带 CRC 时跳过版本后缀比对，
+#   真正的关卡是符号 CRC，而 270 与 236 的导出符号/CRC 必然不同。
+#   ⇒ 本工作流产出仅用于：确认 270 树能否编过、模块差多少、拿 Image 做对比分析。
 
 on:
   workflow_dispatch:
@@ -22,6 +41,10 @@ on:
         description: 'LOCALVERSION 后缀'
         type: string
         default: '-android12-9-o-g-pgw110-270'
+      PROBE_MODULES:
+        description: '是否执行模块可行性探测（只探测，失败不阻断）'
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -92,8 +115,61 @@ jobs:
 
           # 注意：不能清空 scripts/setlocalversion —— CONFIG_LOCALVERSION 正是它拼上去的
 
-          # 该 bundle 是打包上传的仓库，部分脚本丢了可执行位
-          # （run #1 报 ../scripts/pahole-flags.sh: Permission denied）
+          echo "=== 还原被 zip 压平的符号链接 ==="
+          # 判据极保守：普通文件 + 无换行 + 无空格 + <=200B + 内容是相对路径 + 目标真实存在。
+          # 任一条件不满足就不动（宁可漏还原，不可误改真文件）。
+          python3 - <<'PY'
+          import os
+          fixed = kept = err = 0
+          for dirpath, dirnames, filenames in os.walk('.'):
+              if '.git' in dirpath.split(os.sep):
+                  continue
+              for fn in filenames:
+                  p = os.path.join(dirpath, fn)
+                  try:
+                      if os.path.islink(p):
+                          continue
+                      if os.lstat(p).st_size > 200:
+                          continue
+                      with open(p, 'rb') as f:
+                          raw = f.read()
+                  except OSError:
+                      continue
+                  if not raw or b'\n' in raw or b'\r' in raw or b'\x00' in raw:
+                      continue
+                  try:
+                      txt = raw.decode('utf-8')
+                  except UnicodeDecodeError:
+                      continue
+                  if not txt or ' ' in txt or '/' not in txt:
+                      continue
+                  tgt = os.path.normpath(os.path.join(dirpath, txt))
+                  if tgt == os.path.normpath(p) or not os.path.exists(tgt):
+                      kept += 1
+                      continue
+                  # 先建临时链接再原子替换：任何一步失败都不会把原文件删没了
+                  tmp = p + '.symtmp'
+                  try:
+                      if os.path.lexists(tmp):
+                          os.remove(tmp)
+                      os.symlink(os.path.relpath(tgt, dirpath), tmp)
+                      os.replace(tmp, p)
+                      fixed += 1
+                  except OSError:
+                      err += 1
+                      try:
+                          if os.path.lexists(tmp):
+                              os.remove(tmp)
+                      except OSError:
+                          pass
+          print('symlinks restored: %d   (目标不存在跳过: %d, 还原失败: %d)' % (fixed, kept, err))
+          PY
+
+          echo "=== 抽查 build.config ==="
+          ls -l kernel_platform/build/build.config || true
+          test -L kernel_platform/build/build.config && echo "  OK   已是符号链接" || echo "  WARN 仍是普通文件"
+
+          echo "=== 还原 exec 位 ==="
           find kernel_platform -type f -name '*.sh' -print0 | xargs -0 -r chmod +x
           find kernel_platform/common/scripts -maxdepth 3 -type f ! -name '*.*' -print0 | xargs -0 -r chmod +x
           sed -i 's/check_defconfig//' kernel_platform/common/build.config.gki || true
@@ -162,13 +238,54 @@ jobs:
         env:
           PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
+          # ⚠️ 目标必须显式写 Image。
+          #     默认目标 all: 含 dtbs，会把 arch/arm64/boot/dts/ 下所有厂商板卡
+          #     （allwinner/rockchip/...）全编一遍，本树缺 dt-bindings 头文件，必然失败。
+          #     GKI 不需要 DTB，PGW110 也只用 vendor_boot 里的 DTB。
           make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error LOCALVERSION="$LV"
+               CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error LOCALVERSION="$LV" \
+               Image
           ls -la out/arch/arm64/boot/
           echo "=== kernel.release ==="
           cat out/include/config/kernel.release
           echo
           ccache -s || true
+
+      - name: Module feasibility probe (non-blocking)
+        if: ${{ github.event.inputs.PROBE_MODULES != 'false' }}
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}/kernel_platform/common
+        env:
+          PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          # 只探测、不阻断。目的是拿到「OPPO 236 模块源码能否在 270 common 上编译」的真实数据。
+          set +e
+          OUT="${GITHUB_WORKSPACE}/probe_mod.txt"
+          : > "$OUT"
+          echo "=== modules_prepare ===" | tee -a "$OUT"
+          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+               LOCALVERSION="$LV" modules_prepare 2>&1 | tee -a "$OUT" | tail -30
+          echo "modules_prepare RC=${PIPESTATUS[0]}" | tee -a "$OUT"
+
+          for M in vendor/oplus/kernel/touchpanel \
+                   vendor/oplus/kernel/audio \
+                   vendor/oplus/kernel/storage; do
+            D="${GITHUB_WORKSPACE}/${M}"
+            echo "" | tee -a "$OUT"
+            echo "===== ${M} =====" | tee -a "$OUT"
+            if [ ! -d "$D" ]; then echo "  MISS 目录不存在" | tee -a "$OUT"; continue; fi
+            # tee 落盘 + tail 只看本次输出的尾部（不要 tail 整个累积文件）
+            make -j4 -C "${GITHUB_WORKSPACE}/kernel_platform/common" O=out \
+                 ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+                 KCFLAGS=-Wno-error LOCALVERSION="$LV" M="$D" modules \
+                 2>&1 | tee -a "$OUT" | tail -40
+            echo "RC=${PIPESTATUS[0]}" | tee -a "$OUT"
+          done
+
+          echo "" | tee -a "$OUT"
+          echo "=== 编出的 .ko 数量 ===" | tee -a "$OUT"
+          find "${GITHUB_WORKSPACE}/vendor" -name '*.ko' 2>/dev/null | wc -l | tee -a "$OUT"
+          echo "（对比：设备 /vendor_dlkm 里是 377 个 5.10.236 的 .ko）" | tee -a "$OUT"
 
       - name: Package
         run: |
@@ -179,6 +296,11 @@ jobs:
           cp "$IMG" dist/Image
           cp kernel_platform/common/out/.config dist/kernel.config
           cat kernel_platform/common/out/include/config/kernel.release > dist/KERNEL_RELEASE.txt
+          # Module.symvers 是离线核对符号 CRC 的唯一硬证据：设备 .ko 里的 __crc_* 
+          # 与它逐条比对，才能判断「能不能配现有模块一起用」。
+          cp kernel_platform/common/out/Module.symvers dist/Module.symvers 2>/dev/null \
+            || echo "WARN: Module.symvers 不存在"
+          [ -f probe_mod.txt ] && cp probe_mod.txt dist/modules_probe.txt || true
           ls -la dist
           sha256sum dist/Image
 
