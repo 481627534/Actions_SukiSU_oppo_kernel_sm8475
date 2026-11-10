@@ -91,6 +91,11 @@ jobs:
           rm -rf src
 
           # 注意：不能清空 scripts/setlocalversion —— CONFIG_LOCALVERSION 正是它拼上去的
+
+          # 该 bundle 是打包上传的仓库，部分脚本丢了可执行位
+          # （run #1 报 ../scripts/pahole-flags.sh: Permission denied）
+          find kernel_platform -type f -name '*.sh' -print0 | xargs -0 -r chmod +x
+          find kernel_platform/common/scripts -maxdepth 3 -type f ! -name '*.*' -print0 | xargs -0 -r chmod +x
           sed -i 's/check_defconfig//' kernel_platform/common/build.config.gki || true
           echo "--- 布局 ---"
           ls kernel_platform
