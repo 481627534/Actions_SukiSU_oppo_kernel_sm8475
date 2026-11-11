@@ -414,6 +414,84 @@ jobs:
               sys.exit(1)
           PY
 
+      - name: Repair duplicated declaration in f2fs compress.c
+        run: |
+          # 第四处（run 42954239055）：fs/f2fs/compress.c 里 f2fs_alloc_dic() 的局部变量被写了两遍——
+          #   2201  struct f2fs_sb_info *sbi = F2FS_I_SB(cc->inode);
+          #   2202-2204  其它局部变量
+          #   2205  struct f2fs_sb_info *sbi = F2FS_I_SB(cc->inode);   ← 重复
+          #   → error: redefinition of 'sbi'
+          # 又一个合并残留。修法：在同一个函数体内，同名同右值的声明只保留第一次出现的。
+          python3 - <<'PY'
+          import re, sys
+          P = 'kernel_platform/common/fs/f2fs/compress.c'
+          src = open(P, 'r', encoding='utf-8', newline='').read()
+          lines = src.splitlines(True)
+
+          # 定位函数体（大括号配平）
+          start = next((i for i, l in enumerate(lines)
+                        if 'f2fs_alloc_dic(struct compress_ctx *cc)' in l), None)
+          if start is None:
+              print('::error::找不到 f2fs_alloc_dic，树结构已变')
+              sys.exit(1)
+          b = next(i for i in range(start, len(lines)) if lines[i].rstrip() == '{')
+          depth = 0
+          end = None
+          for i in range(b, len(lines)):
+              depth += lines[i].count('{') - lines[i].count('}')
+              if depth == 0 and i > b:
+                  end = i
+                  break
+          if end is None:
+              print('::error::函数体大括号不配平')
+              sys.exit(1)
+          print('f2fs_alloc_dic 位于第 %d-%d 行' % (start + 1, end + 1))
+
+          seen = set()
+          drop = []
+          pat = re.compile(r'^\s*struct\s+f2fs_sb_info\s*\*\s*(\w+)\s*=\s*(.+?);\s*$')
+          for i in range(b, end + 1):
+              m = pat.match(lines[i])
+              if not m:
+                  continue
+              key = (m.group(1), m.group(2).strip())
+              if key in seen:
+                  drop.append(i)
+              else:
+                  seen.add(key)
+          if not drop:
+              print('未发现重复声明（可能已修过）')
+          else:
+              for i in reversed(drop):
+                  print('  删除第 %d 行重复声明: %s' % (i + 1, lines[i].strip()))
+                  del lines[i]
+              open(P, 'w', encoding='utf-8', newline='').write(''.join(lines))
+              print('已删除 %d 行' % len(drop))
+
+          # 校验：只看这个函数体内是否还有重复（同名变量在别的函数里合法存在，不能全局统计）
+          lines2 = open(P, 'r', encoding='utf-8', newline='').readlines()
+          s2 = next(i for i, l in enumerate(lines2)
+                    if 'f2fs_alloc_dic(struct compress_ctx *cc)' in l)
+          b2 = next(i for i in range(s2, len(lines2)) if lines2[i].rstrip() == '{')
+          d2 = 0
+          e2 = None
+          for i in range(b2, len(lines2)):
+              d2 += lines2[i].count('{') - lines2[i].count('}')
+              if d2 == 0 and i > b2:
+                  e2 = i
+                  break
+          keys = []
+          for i in range(b2, e2 + 1):
+              m = pat.match(lines2[i])
+              if m:
+                  keys.append((m.group(1), m.group(2).strip()))
+          dup = len(keys) - len(set(keys))
+          print('校验：函数体内声明 %d 条，重复 %d 条' % (len(keys), dup))
+          if dup:
+              print('::error::函数体内仍有重复声明')
+              sys.exit(1)
+          PY
+
       - name: Apply hmbird patch (OGKI to GKI)
         working-directory: ${{ github.workspace }}/kernel_platform/common
         run: |
