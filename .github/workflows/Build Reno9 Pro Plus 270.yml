@@ -295,6 +295,80 @@ jobs:
           PY
 
 
+      - name: Repair half-applied f2fs lookup_mode patch
+        run: |
+          # bundle 的坏合并在 f2fs 上留下的第二处伤（run 42951874514）：
+          #   fs/f2fs/f2fs.h:5078  enum f2fs_lookup_mode { LOOKUP_PERF/COMPAT/AUTO };
+          #   fs/f2fs/f2fs.h:5083  一个孤立 '}'（原本是某个 static inline 块的结尾）
+          #   但 f2fs_get_lookup_mode() / f2fs_set_lookup_mode() 全树 0 处定义，
+          #   而 dir.c:23、super.c:1279/2061 都在调用；struct f2fs_sb_info 里也没有 lookup_mode 字段。
+          #   ⇒ 合并时把「字段 + 两个 accessor」整段丢了。
+          #
+          # 本步只做最小可编修复：
+          #   ① 删掉孤立 '}'；
+          #   ② 在枚举后补两个 accessor：get 恒返回 LOOKUP_AUTO（上游默认行为），
+          #      set 为空操作 ⇒ 挂载参数 lookup_mode= 会被静默忽略，按 auto 走。
+          # ⚠️ 这是降级实现，不是 OPPO 原特性。仅用于让 270 树编过做对比，
+          #    产物不可当作功能等价的内核。
+          python3 - <<'PY'
+          import sys
+          P = 'kernel_platform/common/fs/f2fs/f2fs.h'
+          lines = open(P, 'r', encoding='utf-8', newline='').readlines()
+
+          start = next((i for i, l in enumerate(lines)
+                        if l.startswith('enum f2fs_lookup_mode')), None)
+          if start is None:
+              print('::error::找不到 enum f2fs_lookup_mode，树结构已变，停止')
+              sys.exit(1)
+          end = next((i for i in range(start, len(lines)) if lines[i].rstrip() == '};'), None)
+          if end is None:
+              print('::error::枚举没有闭合的 };，停止')
+              sys.exit(1)
+          print('enum 位于第 %d-%d 行' % (start + 1, end + 1))
+
+          out = lines[:end + 1]
+
+          # ① 吃掉紧随其后的孤立 '}'
+          j = end + 1
+          while j < len(lines) and lines[j].strip() == '':
+              j += 1
+          if j < len(lines) and lines[j].rstrip() == '}':
+              print('删除孤立右花括号：第 %d 行' % (j + 1))
+              out.extend(lines[end + 1:j])
+              rest = lines[j + 1:]
+          else:
+              print('未发现孤立右花括号（可能已修过）')
+              rest = lines[end + 1:]
+
+          # ② 补 accessor（幂等：已存在就不重复插）
+          body = ''.join(lines)
+          if 'f2fs_get_lookup_mode(' in body.split('enum f2fs_lookup_mode', 1)[-1].split('};', 1)[-1]:
+              print('accessor 已存在，跳过插入')
+          else:
+              out.append('\n')
+              out.append('/* PGW110 build repair: bundle 丢失的 accessor，最小实现 */\n')
+              out.append('static inline enum f2fs_lookup_mode\n')
+              out.append('f2fs_get_lookup_mode(struct f2fs_sb_info *sbi)\n')
+              out.append('{\n')
+              out.append('\t(void)sbi;\n')
+              out.append('\treturn LOOKUP_AUTO;\n')
+              out.append('}\n')
+              out.append('\n')
+              out.append('static inline void f2fs_set_lookup_mode(struct f2fs_sb_info *sbi,\n')
+              out.append('\t\t\t\t\tenum f2fs_lookup_mode mode)\n')
+              out.append('{\n')
+              out.append('\t(void)sbi;\n')
+              out.append('\t(void)mode;\n')
+              out.append('}\n')
+              print('已插入 f2fs_get_lookup_mode / f2fs_set_lookup_mode')
+
+          open(P, 'w', encoding='utf-8', newline='').write(''.join(out) + ''.join(rest))
+
+          chk = ''.join(open(P, 'r', encoding='utf-8', newline='').readlines())
+          print('校验: get=%d 处 set=%d 处'
+                % (chk.count('f2fs_get_lookup_mode'), chk.count('f2fs_set_lookup_mode')))
+          PY
+
       - name: Apply hmbird patch (OGKI to GKI)
         working-directory: ${{ github.workspace }}/kernel_platform/common
         run: |
