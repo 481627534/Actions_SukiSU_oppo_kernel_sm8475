@@ -177,6 +177,97 @@ jobs:
           ls kernel_platform
           ls vendor
 
+      - name: Scan leftover merge conflict markers
+        run: |
+          # bundle 是「半合并」状态提交的：merge 分支 UP270 后冲突标记没清。
+          # 实例（run 42775000831）：kernel_common/include/trace/hooks/binder.h 第 158-159 行残留
+          #     =======
+          #     >>>>>>> UP270
+          #   → clang: include/trace/hooks/binder.h:158:1: error: expected identifier or '('
+          #   → 错误恢复把紧随其后的 static HLIST_HEAD(binder_deferred_list) 整个吞掉
+          #   → binder.c:6323 use of undeclared identifier 'binder_deferred_list'
+          #   → drivers/android/binder.o + binder_alloc.o 全灭，drivers 目录 Error 2
+          #
+          # 本步策略：
+          #   · 只机械处理「======= 紧接 >>>>>>>」且没有 <<<<<<< 开标记的纯残留（另一侧为空，
+          #     等价于取当前这一侧，语义无损）→ 删掉这两行；
+          #   · 任何真正的三方冲突（带 <<<<<<< 或中间有内容）一律列出并终止，绝不猜。
+          python3 - <<'PY'
+          import os, sys
+          auto = {}
+          hard = {}
+          for dp, dns, fns in os.walk('.'):
+              if '.git' in dp.split(os.sep):
+                  continue
+              for fn in fns:
+                  p = os.path.join(dp, fn)
+                  try:
+                      if os.path.islink(p) or os.lstat(p).st_size > 8 * 1024 * 1024:
+                          continue
+                      with open(p, 'rb') as f:
+                          raw = f.read()
+                  except OSError:
+                      continue
+                  # 只有同时含 <<<<<<< 或 >>>>>>> 才算疑似冲突文件；
+                  # 纯 ======= 的行多半是文档里的标题下划线，不能误判。
+                  if b'<<<<<<<' not in raw and b'>>>>>>>' not in raw:
+                      continue
+                  try:
+                      with open(p, 'r', encoding='utf-8', newline='') as f:
+                          lines = f.readlines()
+                  except (OSError, UnicodeDecodeError):
+                      continue
+                  ids = [i for i, l in enumerate(lines)
+                         if l.startswith(('<<<<<<<', '|||||||', '=======', '>>>>>>>'))]
+                  if not ids:
+                      continue
+                  dels = set()
+                  bad = False
+                  for n, i in enumerate(ids):
+                      l = lines[i]
+                      prev = lines[ids[n - 1]] if n > 0 else ''
+                      nxt = lines[ids[n + 1]] if n + 1 < len(ids) else ''
+                      if l.startswith('<<<<<<<'):
+                          bad = True
+                      elif l.startswith('>>>>>>>'):
+                          if not prev.startswith('======='):
+                              bad = True
+                      elif l.startswith('======='):
+                          if prev.startswith('<<<<<<<') or nxt.startswith('<<<<<<<'):
+                              bad = True
+                          elif nxt.startswith('>>>>>>>'):
+                              dels.add(i)
+                              dels.add(ids[n + 1])
+                          else:
+                              bad = True
+                  if bad:
+                      hard.setdefault(p, []).extend(i + 1 for i in ids if i not in dels)
+                      continue
+                  if not dels:
+                      hard.setdefault(p, []).extend(i + 1 for i in ids)
+                      continue
+                  kept = [l for i, l in enumerate(lines) if i not in dels]
+                  with open(p, 'w', encoding='utf-8', newline='') as f:
+                      f.writelines(kept)
+                  auto[p] = [i + 1 for i in dels]
+
+          print('=== 自动清理的纯残留标记 ===')
+          for p, ns in auto.items():
+              print('  FIX  %s  行 %s' % (p, ','.join(map(str, ns))))
+          if not auto:
+              print('  （无）')
+          print('=== 无法机械判定的真冲突 ===')
+          for p, ns in hard.items():
+              print('  HARD %s  行 %s' % (p, ','.join(map(str, sorted(ns)))))
+          if not hard:
+              print('  （无）')
+          if hard:
+              print('::error::发现 %d 个文件存在真冲突，需人工判断后再编' % len(hard))
+              sys.exit(1)
+          print('OK: 共清理 %d 个文件' % len(auto))
+          PY
+
+
       - name: Apply hmbird patch (OGKI to GKI)
         working-directory: ${{ github.workspace }}/kernel_platform/common
         run: |
