@@ -492,6 +492,67 @@ jobs:
               sys.exit(1)
           PY
 
+      - name: Restore missing f2fs lz4armv8 sources
+        run: |
+          # 第五处（run 42954825064）：不是改坏，是**缺文件**——
+          #   fs/f2fs/Makefile:13  f2fs-$(CONFIG_ARM64) += $(addprefix lz4armv8/, lz4accel.o lz4armv8.o)
+          #   但 bundle 的 fs/f2fs/lz4armv8/ 只有 lz4accel.c，
+          #   缺 lz4accel.h(1433B) 与 lz4armv8.S(7790B)
+          #   → make[3]: No rule to make target 'fs/f2fs/lz4armv8/lz4armv8.o'
+          # 依据：bundle 的 lz4accel.c 与 oppo-source 官方树同为 1533 B，同源同版本，
+          #       故从官方 236 树补齐缺失两件是安全的。
+          set -e
+          D=kernel_platform/common/fs/f2fs/lz4armv8
+          BASE='https://raw.githubusercontent.com/oppo-source/android_kernel_common_oppo_sm8475/oppo/sm8475_b_16.0_reno9_pro_plus/fs/f2fs/lz4armv8'
+          echo "=== 补齐前 ==="
+          ls -l "$D" || true
+          for f in lz4accel.h lz4armv8.S; do
+            if [ -s "$D/$f" ]; then
+              echo "  已存在，跳过 $f"
+            else
+              echo "  下载 $f"
+              curl -fsSL --retry 3 "$BASE/$f" -o "$D/$f"
+            fi
+          done
+          echo "=== 补齐后 ==="
+          ls -l "$D"
+          for f in lz4accel.c lz4accel.h lz4armv8.S; do
+            if [ -s "$D/$f" ]; then
+              echo "  OK   $f  $(stat -c%s "$D/$f") B"
+            else
+              echo "::error::仍缺 $f"
+              exit 1
+            fi
+          done
+
+          # 预检（只报告不阻断）：把 fs/f2fs/Makefile 引用的对象对一遍源文件，
+          # 一次性列全缺件，免得一轮只暴露一个、每轮烧 12 分钟。
+          python3 - <<'PY'
+          import os, re
+          P = 'kernel_platform/common/fs/f2fs'
+          mk = open(os.path.join(P, 'Makefile'), encoding='utf-8').read()
+          # 展开 $(addprefix dir/, a.o b.o)
+          mk = re.sub(r'\$\(addprefix\s+([^,]+),\s*([^)]+)\)',
+                      lambda m: ' '.join(m.group(1).strip() + x
+                                         for x in m.group(2).split()), mk)
+          # 复合对象（f2fs-y := / f2fs-$(CONFIG_xxx) += 等）没有同名源文件，要排除
+          comp = set(re.findall(r'^(\w+)-[^=\s]*\s*\+?=', mk, re.M))
+          objs = set(re.findall(r'[\w./-]+\.o\b', mk))
+          missing = []
+          for o in sorted(objs):
+              base = o[:-2]
+              if base in comp:
+                  continue
+              if any(os.path.exists(os.path.join(P, base + e)) for e in ('.c', '.S', '.s')):
+                  continue
+              missing.append(o)
+          print('f2fs/Makefile 引用对象 %d 个，缺源文件 %d 个' % (len(objs), len(missing)))
+          for o in missing:
+              print('  MISS %s' % o)
+          if not missing:
+              print('  无缺件')
+          PY
+
       - name: Apply hmbird patch (OGKI to GKI)
         working-directory: ${{ github.workspace }}/kernel_platform/common
         run: |
