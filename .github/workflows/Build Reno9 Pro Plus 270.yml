@@ -295,6 +295,78 @@ jobs:
           PY
 
 
+      - name: Repair self-including stub headers (from OPPO 236 tree)
+        # 本树有一类独特损坏：头文件被替换成「自己 include 自己」的空壳。
+        # 例 include/uapi/linux/netfilter/xt_mark.h 内容就是
+        #   #ifndef _XT_MARK_H_target / #define … / #include <linux/netfilter/xt_mark.h> / #endif
+        # 结构体全没了 → xt_mark.c 报 incomplete definition of 'struct xt_mark_tginfo2'。
+        # 判据从严：必须「自 include」且「去掉预处理指令后几乎没有内容」才认定为空壳；
+        # 同名文件从 OPPO 官方 236 树取，下载过小/是错误页/无实质内容则跳过，绝不覆盖正常文件。
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}/kernel_platform
+        run: |
+          python3 - <<'PY'
+          import os, re, urllib.request
+
+          BASE = ('https://raw.githubusercontent.com/oppo-source/'
+                  'android_kernel_common_oppo_sm8475/oppo/sm8475_b_16.0_reno9_pro_plus/')
+          COMMON = 'common'
+
+          stubs = []
+          for dp, dns, fns in os.walk(COMMON):
+              if '.git' in dp.split(os.sep):
+                  continue
+              for fn in fns:
+                  if not fn.endswith('.h'):
+                      continue
+                  p = os.path.join(dp, fn)
+                  rel = os.path.relpath(p, COMMON).replace(os.sep, '/')
+                  cands = set()
+                  if rel.startswith('include/uapi/'):
+                      cands.add(rel[len('include/uapi/'):])
+                  if rel.startswith('include/'):
+                      cands.add(rel[len('include/'):])
+                  if not cands:
+                      continue
+                  try:
+                      text = open(p, 'r', encoding='utf-8', errors='replace').read()
+                  except OSError:
+                      continue
+                  incs = re.findall(r'#\s*include\s*[<"]([^>"]+)[>"]', text)
+                  self_inc = [i for i in incs if i in cands]
+                  if not self_inc:
+                      continue
+                  body = re.sub(r'^\s*#.*$', '', text, flags=re.M)
+                  if len(body.strip()) > 40:
+                      continue
+                  stubs.append((p, rel, self_inc))
+
+          print('=== 自 include 空壳头文件 ===')
+          for p, rel, s in stubs:
+              print('  STUB  %-56s -> %s' % (rel, s[0]))
+          if not stubs:
+              print('  （无）')
+
+          fixed = 0
+          for p, rel, s in stubs:
+              try:
+                  data = urllib.request.urlopen(BASE + rel, timeout=60).read()
+              except Exception as e:
+                  print('  FAIL  %s 下载失败: %s' % (rel, str(e)[:60]))
+                  continue
+              # UAPI 小头文件本来就小（如 xt_mark.h 正常版仅 260 B），
+              # 所以下限只设 100 B，另外排除 HTML 错误页与空内容。
+              if len(data) < 100 or b'<html' in data.lower() \
+                      or (b'struct' not in data and b'#define' not in data):
+                  print('  SKIP  %s 下载仅 %d B / 内容不可信，不写' % (rel, len(data)))
+                  continue
+              with open(p, 'wb') as f:
+                  f.write(data)
+              print('  FIXED %s -> %d B' % (rel, len(data)))
+              fixed += 1
+          print('共修复 %d 个空壳头' % fixed)
+          PY
+
       - name: Repair half-applied f2fs lookup_mode patch
         run: |
           # bundle 的坏合并在 f2fs 上留下的第二处伤（run 42951874514）：
@@ -609,7 +681,10 @@ jobs:
           if [ "$fail" != "0" ]; then echo "::error::关键配置缺失"; exit 1; fi
           ccache -z || true
 
-      - name: Build kernel
+      - name: Build kernel (keep-going, collect every error)
+        id: build
+        continue-on-error: true
+        timeout-minutes: 150
         working-directory: ${{ github.workspace }}/kernel_platform/common
         env:
           PATH: /home/runner/clang-r416183b/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -618,14 +693,72 @@ jobs:
           #     默认目标 all: 含 dtbs，会把 arch/arm64/boot/dts/ 下所有厂商板卡
           #     （allwinner/rockchip/...）全编一遍，本树缺 dt-bindings 头文件，必然失败。
           #     GKI 不需要 DTB，PGW110 也只用 vendor_boot 里的 DTB。
-          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+          #
+          # ⚠️ 本轮改造核心：make -k（keep-going）。
+          #     之前每轮只暴露 1 个错误、烧 12 分钟 CI。加 -k 后遇到错误继续编其它文件，
+          #     一轮就能把全树所有错误一次性摊开，把「N 轮 × 1 条信息」压成「1 轮 × N 条」。
+          #     Image 编过之后继续 make modules —— 因为「能用」要求 Image 与 .ko 同源同编，
+          #     只有两者同一次编译产出，CONFIG_MODVERSIONS 的符号 CRC 才自洽。
+          set +e
+          LOG="${GITHUB_WORKSPACE}/build.log"
+          ERR="${GITHUB_WORKSPACE}/build_errors.txt"
+          : > "$LOG"
+
+          echo "=== make Image (keep-going) ==="
+          make -k -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error LOCALVERSION="$LV" \
-               Image
-          ls -la out/arch/arm64/boot/
-          echo "=== kernel.release ==="
-          cat out/include/config/kernel.release
-          echo
+               Image >> "$LOG" 2>&1
+          RC_IMG=$?
+          echo "make Image rc=$RC_IMG"
+
+          IMAGE_OK=0
+          [ -s out/arch/arm64/boot/Image ] && IMAGE_OK=1
+          echo "IMAGE_OK=$IMAGE_OK"
+
+          RC_MOD="skipped"
+          if [ "$IMAGE_OK" = "1" ]; then
+            echo "=== make modules (keep-going) ==="
+            make -k -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+                 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error LOCALVERSION="$LV" \
+                 modules >> "$LOG" 2>&1
+            RC_MOD=$?
+            echo "make modules rc=$RC_MOD"
+          fi
+
+          {
+            echo "########## 构建错误汇总 ##########"
+            echo "make Image  rc=$RC_IMG    Image 生成=$IMAGE_OK    make modules rc=$RC_MOD"
+            echo
+            echo "---------- error: 总行数 ----------"
+            grep -c 'error:' "$LOG" || true
+            echo
+            echo "---------- 按出错文件聚合（前 80，数字=该文件错误条数）----------"
+            grep -oE '^[^ :]+:[0-9]+:[0-9]+: (fatal )?error:' "$LOG" | sed -E 's/:[0-9]+:[0-9]+:.*//' | sort | uniq -c | sort -rn | head -80
+            echo
+            echo "---------- 错误文本去重（前 60 种，数字=出现次数）----------"
+            grep -oE '(fatal )?error: .*' "$LOG" | sort | uniq -c | sort -rn | head -60
+            echo
+            echo "---------- 非 error: 类失败（缺文件/链接失败/被杀）----------"
+            grep -E 'No rule to make target|undefined reference|ld\.lld: error|Killed|Segmentation fault' "$LOG" | sort -u | head -60
+            echo
+            echo "---------- 已编出的 .ko 数量 ----------"
+            find "$GITHUB_WORKSPACE" -name '*.ko' 2>/dev/null | wc -l
+            echo "（设备 /vendor_dlkm 现有：377 个 5.10.236 的 .ko）"
+          } > "$ERR" 2>&1
+          cat "$ERR"
           ccache -s || true
+
+      - name: Build verdict
+        run: |
+          if [ -s kernel_platform/common/out/arch/arm64/boot/Image ]; then
+            echo "OK: Image 已生成"
+            ls -la kernel_platform/common/out/arch/arm64/boot/
+            echo "=== kernel.release ==="
+            cat kernel_platform/common/out/include/config/kernel.release
+          else
+            echo "::error::Image 未生成。本轮用 make -k 已一次性收集全树错误，请下载 artifact 里的 build_errors.txt"
+            exit 1
+          fi
 
       - name: Module feasibility probe (non-blocking)
         if: ${{ github.event.inputs.PROBE_MODULES != 'false' }}
@@ -681,8 +814,12 @@ jobs:
           sha256sum dist/Image
 
       - name: Upload artifacts
+        # 失败也要上传：build_errors.txt 是这一轮唯一真正有价值的产出。
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: PGW110-kernel-5.10.270-${{ github.run_number }}
-          path: dist/*
-          if-no-files-found: error
+          path: |
+            dist/*
+            build_errors.txt
+          if-no-files-found: warn
