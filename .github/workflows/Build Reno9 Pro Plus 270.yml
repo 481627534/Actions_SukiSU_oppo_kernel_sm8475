@@ -295,76 +295,69 @@ jobs:
           PY
 
 
-      - name: Repair self-including stub headers (from OPPO 236 tree)
-        # 本树有一类独特损坏：头文件被替换成「自己 include 自己」的空壳。
-        # 例 include/uapi/linux/netfilter/xt_mark.h 内容就是
-        #   #ifndef _XT_MARK_H_target / #define … / #include <linux/netfilter/xt_mark.h> / #endif
-        # 结构体全没了 → xt_mark.c 报 incomplete definition of 'struct xt_mark_tginfo2'。
-        # 判据从严：必须「自 include」且「去掉预处理指令后几乎没有内容」才认定为空壳；
-        # 同名文件从 OPPO 官方 236 树取，下载过小/是错误页/无实质内容则跳过，绝不覆盖正常文件。
+      - name: Restore damaged netfilter uapi headers (align with OPPO 236 tree)
+        # 本树的一类系统性损坏：include/uapi/linux/netfilter/ 下有 5 个头文件被替换成
+        # 「自己 include 自己」的空壳或截断版本，结构体/宏定义整段丢失。典型形态：
+        #   /* SPDX-License-Identifier: GPL-2.0 ... */
+        #   #ifndef _XT_MARK_H_target
+        #   #define _XT_MARK_H_target
+        #   #include <linux/netfilter/xt_mark.h>     <-- 引用自己
+        #   #endif
+        # 后果：xt_mark.c 报 incomplete definition of 'struct xt_mark_tginfo2'，
+        #       xt_dscp.c 报 use of undeclared identifier 'XT_DSCP_SHIFT' 等。
+        #
+        # 判据不看猜测、只比大小：以 OPPO 官方 236 树同名文件为准，
+        #   本地比官方小 -> 判为损坏，下载覆盖；本地 >= 官方 -> 一律不动。
+        # 下载长度必须与官方 size 完全相等，否则视为错误页跳过。
+        # netfilter uapi 在 5.10 stable 区间内几乎不变，此操作不会引入版本回退。
         continue-on-error: true
-        working-directory: ${{ github.workspace }}/kernel_platform
+        working-directory: ${{ github.workspace }}
         run: |
           python3 - <<'PY'
-          import os, re, urllib.request
+          import os, json, urllib.request, urllib.parse
 
-          BASE = ('https://raw.githubusercontent.com/oppo-source/'
-                  'android_kernel_common_oppo_sm8475/oppo/sm8475_b_16.0_reno9_pro_plus/')
-          COMMON = 'common'
+          API = 'https://api.github.com/repos/oppo-source/android_kernel_common_oppo_sm8475/contents/'
+          RAW = ('https://raw.githubusercontent.com/oppo-source/'
+                 'android_kernel_common_oppo_sm8475/oppo/sm8475_b_16.0_reno9_pro_plus/')
+          REL = 'include/uapi/linux/netfilter'
+          DIR = 'kernel_platform/common/' + REL
 
-          stubs = []
-          for dp, dns, fns in os.walk(COMMON):
-              if '.git' in dp.split(os.sep):
-                  continue
-              for fn in fns:
-                  if not fn.endswith('.h'):
-                      continue
-                  p = os.path.join(dp, fn)
-                  rel = os.path.relpath(p, COMMON).replace(os.sep, '/')
-                  cands = set()
-                  if rel.startswith('include/uapi/'):
-                      cands.add(rel[len('include/uapi/'):])
-                  if rel.startswith('include/'):
-                      cands.add(rel[len('include/'):])
-                  if not cands:
-                      continue
-                  try:
-                      text = open(p, 'r', encoding='utf-8', errors='replace').read()
-                  except OSError:
-                      continue
-                  incs = re.findall(r'#\s*include\s*[<"]([^>"]+)[>"]', text)
-                  self_inc = [i for i in incs if i in cands]
-                  if not self_inc:
-                      continue
-                  body = re.sub(r'^\s*#.*$', '', text, flags=re.M)
-                  if len(body.strip()) > 40:
-                      continue
-                  stubs.append((p, rel, self_inc))
+          def get(url):
+              req = urllib.request.Request(url, headers={'User-Agent': 'kernel-build-ci'})
+              return urllib.request.urlopen(req, timeout=90).read()
 
-          print('=== 自 include 空壳头文件 ===')
-          for p, rel, s in stubs:
-              print('  STUB  %-56s -> %s' % (rel, s[0]))
-          if not stubs:
-              print('  （无）')
+          try:
+              ref = urllib.parse.quote('oppo/sm8475_b_16.0_reno9_pro_plus', safe='')
+              lst = json.loads(get(API + REL + '?ref=' + ref).decode())
+              official = {x['name']: x['size'] for x in lst if x['type'] == 'file'}
+          except Exception as e:
+              print('::error::取 OPPO 236 文件表失败: %s（本步跳过，不影响编译）' % str(e)[:120])
+              official = {}
 
+          print('=== netfilter uapi 头体检（官方 %d 个）===' % len(official))
           fixed = 0
-          for p, rel, s in stubs:
-              try:
-                  data = urllib.request.urlopen(BASE + rel, timeout=60).read()
-              except Exception as e:
-                  print('  FAIL  %s 下载失败: %s' % (rel, str(e)[:60]))
+          for name, osz in sorted(official.items()):
+              p = os.path.join(DIR, name)
+              if not os.path.exists(p):
+                  print('  MISS   %-24s 本地不存在（另行处理）' % name)
                   continue
-              # UAPI 小头文件本来就小（如 xt_mark.h 正常版仅 260 B），
-              # 所以下限只设 100 B，另外排除 HTML 错误页与空内容。
-              if len(data) < 100 or b'<html' in data.lower() \
-                      or (b'struct' not in data and b'#define' not in data):
-                  print('  SKIP  %s 下载仅 %d B / 内容不可信，不写' % (rel, len(data)))
+              lsz = os.path.getsize(p)
+              if lsz >= osz:
+                  continue
+              try:
+                  data = get(RAW + REL + '/' + name)
+              except Exception as e:
+                  print('  FAIL   %-24s 下载失败 %s' % (name, str(e)[:60]))
+                  continue
+              if len(data) != osz:
+                  print('  SKIP   %-24s 下载 %d B != 官方 %d B' % (name, len(data), osz))
                   continue
               with open(p, 'wb') as f:
                   f.write(data)
-              print('  FIXED %s -> %d B' % (rel, len(data)))
+              print('  FIXED  %-24s %d B -> %d B' % (name, lsz, len(data)))
               fixed += 1
-          print('共修复 %d 个空壳头' % fixed)
+
+          print('共修复 %d 个文件' % fixed)
           PY
 
       - name: Repair half-applied f2fs lookup_mode patch
