@@ -191,11 +191,27 @@ jobs:
           # 本步策略：
           #   · 只机械处理「======= 紧接 >>>>>>>」且没有 <<<<<<< 开标记的纯残留（另一侧为空，
           #     等价于取当前这一侧，语义无损）→ 删掉这两行；
-          #   · 任何真正的三方冲突（带 <<<<<<< 或中间有内容）一律列出并终止，绝不猜。
+          #   · 任何真正的三方冲突（带 <<<<<<< 或中间有内容）一律列出：
+          #       - 出现在源码/构建文件里 → 阻断（exit 1），绝不猜；
+          #       - 只出现在文档里（.txt/.rst/.md…）→ 仅记录 INFO，不阻断（不参与编译）。
+          #   · 纯 ======= 的文档标题下划线不在扫描范围内（必须同时含 <<<<<<< 或 >>>>>>> 才算）。
           python3 - <<'PY'
           import os, sys
+          CODE_EXT = {'.c', '.h', '.cc', '.cpp', '.cxx', '.S', '.s', '.rs',
+                      '.dts', '.dtsi', '.mk', '.bp', '.sh', '.py', '.yaml', '.yml',
+                      '.config', '.kconfig', '.inc', '.lds', '.ld'}
+          CODE_NAME = {'Makefile', 'Kbuild', 'Kconfig', 'Android.mk', 'Android.bp',
+                       'BUILD.bazel', 'CMakeLists.txt'}
+
+          def is_code(p):
+              b = os.path.basename(p)
+              if b in CODE_NAME:
+                  return True
+              return os.path.splitext(b)[1].lower() in CODE_EXT
+
           auto = {}
           hard = {}
+          info = {}
           for dp, dns, fns in os.walk('.'):
               if '.git' in dp.split(os.sep):
                   continue
@@ -240,31 +256,42 @@ jobs:
                               dels.add(ids[n + 1])
                           else:
                               bad = True
+                  code = is_code(p)
                   if bad:
-                      hard.setdefault(p, []).extend(i + 1 for i in ids if i not in dels)
+                      (hard if code else info).setdefault(p, []).extend(
+                          i + 1 for i in ids if i not in dels)
                       continue
                   if not dels:
-                      hard.setdefault(p, []).extend(i + 1 for i in ids)
+                      (hard if code else info).setdefault(p, []).extend(i + 1 for i in ids)
+                      continue
+                  if not code:
+                      # 文档里的残留标记不影响编译，只记录不修改
+                      info[p] = [i + 1 for i in dels]
                       continue
                   kept = [l for i, l in enumerate(lines) if i not in dels]
                   with open(p, 'w', encoding='utf-8', newline='') as f:
                       f.writelines(kept)
                   auto[p] = [i + 1 for i in dels]
 
-          print('=== 自动清理的纯残留标记 ===')
+          print('=== 自动清理的纯残留标记（源码文件）===')
           for p, ns in auto.items():
               print('  FIX  %s  行 %s' % (p, ','.join(map(str, ns))))
           if not auto:
               print('  （无）')
-          print('=== 无法机械判定的真冲突 ===')
+          print('=== 阻断：源码文件里的真冲突 ===')
           for p, ns in hard.items():
               print('  HARD %s  行 %s' % (p, ','.join(map(str, sorted(ns)))))
           if not hard:
               print('  （无）')
+          print('=== 仅记录：文档里的残留标记（不阻断）===')
+          for p, ns in info.items():
+              print('  INFO %s  行 %s' % (p, ','.join(map(str, sorted(ns)))))
+          if not info:
+              print('  （无）')
           if hard:
-              print('::error::发现 %d 个文件存在真冲突，需人工判断后再编' % len(hard))
+              print('::error::源码文件存在 %d 处真冲突，需人工判断后再编' % len(hard))
               sys.exit(1)
-          print('OK: 共清理 %d 个文件' % len(auto))
+          print('OK: 清理 %d 个源码文件，文档残留 %d 处（已忽略）' % (len(auto), len(info)))
           PY
 
 
