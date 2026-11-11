@@ -28,11 +28,17 @@ name: Build Reno9 Pro Plus 270
 #   270 common 树 ⇒ 想让 236 模块源码在 270 上全量编过，缺的是内核侧的 hook 移植，
 #   不是 CI 配置。故本工作流只做「探测」，不承诺模块能编成。
 #
-# ===== 产物定位（别误用）=====
-#   Image 即使编过，也【不能】配设备上 377 个 5.10.236 预编译 .ko：
-#   kernel/module.c 的 same_magic() 在 MODVERSIONS=y 且模块带 CRC 时跳过版本后缀比对，
-#   真正的关卡是符号 CRC，而 270 与 236 的导出符号/CRC 必然不同。
-#   ⇒ 本工作流产出仅用于：确认 270 树能否编过、模块差多少、拿 Image 做对比分析。
+# ===== 产物定位（2026-11-11 实测修正，别再按老结论判断）=====
+#   旧结论「270 Image 必然配不上 236 的 .ko，因为导出符号/CRC 肯定不同」——【已推翻】。
+#   实测（run 42962615306 的 Image，离线逐条核对）：
+#     · 设备模块总数 = 838（vendor_boot 461 + vendor_dlkm 377），不是 377
+#     · 模块符号引用 45,684 条 → 内核满足 40,387 + 模块间互导 5,297 = 全覆盖，真缺 0
+#     · 内核符号 CRC 不一致 0 条
+#     · module_layout = 0x7c24b32d，270 内核与 838 个模块【全部一致】
+#     · vermagic 后缀 838/838 完全一致
+#   ⇒ 270 Image 与设备现成模块 ABI 兼容。Linux stable 不动导出符号 ABI，这是符合预期的。
+#   ⚠️ 唯一真问题是 root：设备 ramdisk 里的 kernelsu.ko 引用了 48 个 SELinux 内部符号，
+#      236/270 内核都没导出 ⇒ 那个 .ko 加载不了。故本工作流默认内建 SukiSU-Ultra。
 
 on:
   workflow_dispatch:
@@ -41,6 +47,10 @@ on:
         description: 'LOCALVERSION 后缀'
         type: string
         default: '-android12-9-o-g-pgw110-270'
+      ENABLE_KSU:
+        description: '集成 SukiSU-Ultra（内核自带 root，不再依赖 ramdisk 里的 kernelsu.ko）'
+        type: boolean
+        default: true
       PROBE_MODULES:
         description: '是否执行模块可行性探测（只探测，失败不阻断）'
         type: boolean
@@ -625,6 +635,37 @@ jobs:
           patch -p1 -F 3 < "${GITHUB_WORKSPACE}/Patches/hmbird_patch.patch"
           ls -la drivers/hmbird_patch.c
 
+      # ---------------------------------------------------------------
+      # SukiSU-Ultra（KernelSU 分支）：把 root 编进内核本体
+      #
+      # 为什么要它：设备 boot 的 ramdisk 里那个 kernelsu.ko 是 LKM 模式产物，
+      # vermagic 是 5.10.252-dirty，且引用 48 个 SELinux 内部符号
+      # （avc_has_perm / policydb_* / kallsyms_lookup_name ...）。
+      # 已核实 236 官方 Image 与 270 Image 都没导出这些符号 ⇒ 它加载不了。
+      # 内建 KSU 后不再需要任何外部 .ko，root 由内核自己提供。
+      #
+      # setup.sh 行为：clone 到 $GKI_ROOT/KernelSU → 在 drivers/ 建 kernelsu 符号链接
+      # → drivers/Makefile 追加 obj-$(CONFIG_KSU) += kernelsu/
+      # → drivers/Kconfig 插入 source "drivers/kernelsu/Kconfig"
+      # ⚠️ 它自己建的是真符号链接，不受 bundle 仓库「链接被压成文本」的原罪影响。
+      # ---------------------------------------------------------------
+      - name: Add KernelSU (SukiSU-Ultra)
+        if: ${{ github.event.inputs.ENABLE_KSU == 'true' || github.event.inputs.ENABLE_KSU == '' }}
+        working-directory: ${{ github.workspace }}/kernel_platform/common
+        run: |
+          set -e
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+          echo "--- 安装结果 ---"
+          ls -la KernelSU | head -8
+          echo "--- drivers/kernelsu 链接 ---"
+          ls -la drivers/kernelsu
+          test -f drivers/kernelsu/Makefile || { echo "::error::drivers/kernelsu/Makefile 不存在，符号链接没建对"; exit 1; }
+          echo "--- Makefile / Kconfig 挂载点 ---"
+          grep -n "kernelsu" drivers/Makefile
+          grep -n "kernelsu" drivers/Kconfig
+          echo "--- Kconfig 里 KSU 的依赖项 ---"
+          head -40 drivers/kernelsu/Kconfig
+
       - name: Patch defconfig
         working-directory: ${{ github.workspace }}/kernel_platform/common
         run: |
@@ -640,9 +681,12 @@ jobs:
           CONFIG_NETFILTER_XT_TARGET_HL=y
           CONFIG_IP6_NF_NAT=y
           CONFIG_IP6_NF_TARGET_MASQUERADE=y
+
+          # ===== PGW110 移植：KernelSU 内建 root =====
+          CONFIG_KSU=y
           EOF
           echo "LOCALVERSION 将由 make 传入：$LV"
-          tail -11 "$CFG"
+          tail -13 "$CFG"
 
       - name: Configure and verify
         working-directory: ${{ github.workspace }}/kernel_platform/common
@@ -668,6 +712,13 @@ jobs:
                    CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE; do
             if grep -qx "${k}=y" out/.config; then echo "  OK   $k"; else echo "  MISS $k"; fail=1; fi
           done
+          # KSU 若依赖不满足会被 olddefconfig 静默关掉，必须在这里拦住
+          if grep -qx 'CONFIG_KSU=y' out/.config; then
+            echo "  OK   CONFIG_KSU"
+          else
+            echo "  MISS CONFIG_KSU（Kconfig 依赖没满足，内建 root 会失效）"; fail=1
+            grep -iE 'KSU' out/.config || true
+          fi
           echo "=== 版本/LTO/裁剪 ==="
           grep -E '^CONFIG_LTO_|^# CONFIG_LTO_|CONFIG_TRIM_UNUSED_KSYMS' out/.config
           make -s O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION="$LV" kernelrelease
@@ -803,6 +854,39 @@ jobs:
           cp kernel_platform/common/out/Module.symvers dist/Module.symvers 2>/dev/null \
             || echo "WARN: Module.symvers 不存在"
           [ -f probe_mod.txt ] && cp probe_mod.txt dist/modules_probe.txt || true
+
+          # ===== KernelSU 内建自检（离线可判，不靠猜）=====
+          OUT=ksu_check.txt
+          {
+            echo "=== 1. 配置层 ==="
+            grep -E '^CONFIG_KSU' dist/kernel.config || echo "MISS: 配置里没有 CONFIG_KSU"
+            echo ""
+            echo "=== 2. 源码层：kernelsu 有没有真的参与编译 ==="
+            KOBJ=$(find kernel_platform/common/out/drivers/kernelsu -name '*.o' 2>/dev/null | wc -l)
+            echo "out/drivers/kernelsu/*.o = $KOBJ 个"
+            KSRC=$(find kernel_platform/common/drivers/kernelsu -name '*.c' 2>/dev/null | wc -l)
+            echo "drivers/kernelsu/*.c   = $KSRC 个"
+            ls kernel_platform/common/out/drivers/kernelsu/ 2>/dev/null | head -12
+            echo ""
+            echo "=== 3. 二进制层：Image 里的 KernelSU 痕迹 ==="
+            for pat in kernelsu KSU_VERSION ksu_handle_execveat; do
+              n=$(grep -ac "$pat" dist/Image 2>/dev/null || true)
+              echo "  $pat : ${n:-0} 次"
+            done
+            echo ""
+            echo "=== 4. 导出的 KSU 符号（供 ksu 管理器识别）==="
+            grep -iE '\bksu|kernelsu' dist/Module.symvers 2>/dev/null | head -20 || echo "（无）"
+          } | tee "$OUT"
+          cp "$OUT" dist/ksu_check.txt
+
+          echo ""
+          echo "=== 判定 ==="
+          if grep -qx 'CONFIG_KSU=y' dist/kernel.config && [ "$(grep -ac kernelsu dist/Image 2>/dev/null || echo 0)" -gt 0 ]; then
+            echo "KSU_OK：配置已开 + Image 里有 kernelsu 痕迹"
+          else
+            echo "::warning::KSU 可能没真正编进 Image，请看 ksu_check.txt"
+          fi
+
           ls -la dist
           sha256sum dist/Image
 
