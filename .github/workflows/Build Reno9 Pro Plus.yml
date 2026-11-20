@@ -140,6 +140,30 @@ jobs:
           grep -n "hmbird_patch" drivers/Makefile
           ls -la drivers/hmbird_patch.c
 
+      - name: Patch close_range (backport CLOSE_RANGE_CLOEXEC)
+        working-directory: ${{ github.workspace }}/kernel_platform/common
+        run: |
+          # ===== Android 17 热点打不开的内核侧真因 =====
+          # Android 17 的 netd 在拉起 dnsmasq 时会调
+          #     close_range(fd, max_fd, CLOSE_RANGE_CLOEXEC)
+          # 本树 fs/file.c 是 Linux 5.10 原样实现，只有：
+          #     if (flags & ~CLOSE_RANGE_UNSHARE) return -EINVAL;
+          # ⇒ CLOSE_RANGE_CLOEXEC(1<<2) 一律 -EINVAL ⇒ dnsmasq 起不来
+          # ⇒ netd 写管道收 SIGPIPE ⇒ pipe abort ⇒ 热点打不开
+          #
+          # 实机证据（C17 v0.8.2 日志，开热点那一刻）：
+          #   <critical>Some other process ... want to send sig:13 to pid:... tgid:1566 comm:Binder:netd
+          #   logd: SocketClient: write error (Broken pipe)
+          #
+          # 本补丁移植 Linux 5.11 commit 582f1fb6b721
+          #   "fs, close_range: add flag CLOSE_RANGE_CLOEXEC"
+          # 改动仅两处：uapi 头加一个宏；__close_range 加一个 CLOEXEC 分支。
+          # CLOSE_RANGE_UNSHARE 原路径完全不变，不影响其他任何调用者。
+          patch -p1 -F 3 < "${GITHUB_WORKSPACE}/Patches/close_range_cloexec.patch"
+          echo "=== 打补丁后校验（grep 失败会直接让本步骤失败）==="
+          grep -n "CLOSE_RANGE_CLOEXEC" include/uapi/linux/close_range.h
+          grep -n "CLOSE_RANGE_CLOEXEC" fs/file.c
+
       - name: Add KernelSU
         if: ${{ github.event.inputs.ENABLE_KSU == 'true' }}
         working-directory: ${{ github.workspace }}/kernel_platform/common

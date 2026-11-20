@@ -1,0 +1,63 @@
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -718,7 +718,7 @@
+ 	struct task_struct *me = current;
+ 	struct files_struct *cur_fds = me->files, *fds = NULL;
+ 
+-	if (flags & ~CLOSE_RANGE_UNSHARE)
++	if (flags & ~(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC))
+ 		return -EINVAL;
+ 
+ 	if (fd > max_fd)
+@@ -756,15 +756,31 @@
+ 	}
+ 
+ 	max_fd = min(max_fd, cur_max);
+-	while (fd <= max_fd) {
+-		struct file *file;
+-
+-		file = pick_file(cur_fds, fd++);
+-		if (!file)
+-			continue;
+-
+-		filp_close(file, cur_fds);
+-		cond_resched();
++
++	if (flags & CLOSE_RANGE_CLOEXEC) {
++		unsigned int i;
++		struct fdtable *fdt;
++
++		spin_lock(&cur_fds->file_lock);
++		fdt = files_fdtable(cur_fds);
++		for (i = fd; i <= max_fd; i++) {
++			if (fd_is_open(i, fdt))
++				__set_close_on_exec(i, fdt);
++			else
++				__clear_close_on_exec(i, fdt);
++		}
++		spin_unlock(&cur_fds->file_lock);
++	} else {
++		while (fd <= max_fd) {
++			struct file *file;
++
++			file = pick_file(cur_fds, fd++);
++			if (!file)
++				continue;
++
++			filp_close(file, cur_fds);
++			cond_resched();
++		}
+ 	}
+ 
+ 	if (fds) {
+--- a/include/uapi/linux/close_range.h
++++ b/include/uapi/linux/close_range.h
+@@ -4,6 +4,8 @@
+ 
+ /* Unshare the file descriptor table before closing file descriptors. */
+ #define CLOSE_RANGE_UNSHARE	(1U << 1)
++/* Set the close-on-exec flag on file descriptors in the range. */
++#define CLOSE_RANGE_CLOEXEC	(1U << 2)
+ 
+ #endif /* _UAPI_LINUX_CLOSE_RANGE_H */
+ 
