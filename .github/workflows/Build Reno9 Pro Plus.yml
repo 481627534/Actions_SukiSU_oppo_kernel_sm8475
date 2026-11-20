@@ -159,7 +159,9 @@ jobs:
           #   "fs, close_range: add flag CLOSE_RANGE_CLOEXEC"
           # 改动仅两处：uapi 头加一个宏；__close_range 加一个 CLOEXEC 分支。
           # CLOSE_RANGE_UNSHARE 原路径完全不变，不影响其他任何调用者。
-          patch -p1 -F 3 < "${GITHUB_WORKSPACE}/Patches/close_range_cloexec.patch"
+          # 行尾清洗：不管仓库怎么存，喂给 patch 的一定是纯 LF
+          tr -d '\r' < "${GITHUB_WORKSPACE}/Patches/close_range_cloexec.patch" > /tmp/cr.patch
+          patch -p1 -F 3 < /tmp/cr.patch
           echo "=== 打补丁后校验（grep 失败会直接让本步骤失败）==="
           grep -n "CLOSE_RANGE_CLOEXEC" include/uapi/linux/close_range.h
           grep -n "CLOSE_RANGE_CLOEXEC" fs/file.c
