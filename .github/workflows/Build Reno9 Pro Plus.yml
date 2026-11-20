@@ -172,6 +172,26 @@ jobs:
             "$S" --file out/.config --enable "$k"
           done
 
+          # ===== 2026-11-20 热点修复：ipset 的 16 种集合类型 =====
+          # 主开关 IP_SET=y / NETFILTER_XT_SET=y 一直是开的，但 16 种 set type
+          # 一个都没编进去 ⇒ 内核里没有任何可用的集合类型 ⇒
+          # `ipset create xxx hash:ip` 必然失败 ⇒ hostapd 建 ACL 集合失败后 0.9 秒退出。
+          # 物证（三方内核 .config 实测对比）：
+          #   Ace Pro 热点内核    ipset 16/16 全开 + MAX=65534 + 4 个 HL/ECN/TTL target
+          #   一加10Pro 热点内核  ipset 16/16 全开 + MAX=65534，4 个 target 反而是关的
+          #   我们的 236/270       ipset  0/16，MAX=256
+          # ⇒ 一加10Pro 只靠 ipset 就修好了热点，故必修项只有这 17 项；
+          #    Ace Pro 多出的 4 个 target 先不加，保持"一次一变量"便于归因。
+          for k in IP_SET_BITMAP_IP IP_SET_BITMAP_IPMAC IP_SET_BITMAP_PORT \
+                   IP_SET_HASH_IP IP_SET_HASH_IPMAC IP_SET_HASH_IPMARK \
+                   IP_SET_HASH_IPPORT IP_SET_HASH_IPPORTIP IP_SET_HASH_IPPORTNET \
+                   IP_SET_HASH_MAC IP_SET_HASH_NET IP_SET_HASH_NETIFACE \
+                   IP_SET_HASH_NETNET IP_SET_HASH_NETPORT IP_SET_HASH_NETPORTNET \
+                   IP_SET_LIST_SET; do
+            "$S" --file out/.config --enable "$k"
+          done
+          "$S" --file out/.config --set-val IP_SET_MAX 65534
+
           # stock 的 CONFIG_UNUSED_KSYMS_WHITELIST 指向 OPPO 编译机的绝对路径
           # （/work/000f/workspace/.../abi_symbollist.raw），本机构建必然找不到。
           # 关掉符号裁剪：保留全部 EXPORT_SYMBOL，是 stock 的超集，
